@@ -37,6 +37,9 @@ riscof_work
 *.tmp
 ~*
 
+# VUnit build artifacts
+sim/vunit/vunit_out/
+
 # generated documentation stuff
 /docs/doxygen_build/
 /docs/public/
