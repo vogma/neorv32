@@ -208,7 +208,7 @@ BEGIN
   -- ======================================================================== --
   -- DUT                                                                      --
   -- ======================================================================== --
-  dut : ENTITY neorv32.neorv32_cache
+  dut : ENTITY neorv32.neorv32_cache_wb
     GENERIC MAP(
       NUM_BLOCKS => NUM_BLOCKS,
       BLOCK_SIZE => BLOCK_SIZE,

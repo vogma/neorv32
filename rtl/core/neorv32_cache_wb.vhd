@@ -78,6 +78,8 @@ ARCHITECTURE neorv32_cache_rtl OF neorv32_cache_wb IS
   TYPE cache_o_t IS RECORD
     cmd_clr : STD_ULOGIC;
     cmd_new : STD_ULOGIC;
+    cmd_dirty_set : STD_ULOGIC;
+    cmd_dirty_clr : STD_ULOGIC;
     addr : STD_ULOGIC_VECTOR(31 DOWNTO 0);
     data : STD_ULOGIC_VECTOR(31 DOWNTO 0);
     we : STD_ULOGIC_VECTOR(3 DOWNTO 0);
@@ -107,6 +109,9 @@ ARCHITECTURE neorv32_cache_rtl OF neorv32_cache_wb IS
     tag_idx : STD_ULOGIC_VECTOR((tag_width_c + index_width_c) - 1 DOWNTO 0); -- tag & index
     ofs_int : STD_ULOGIC_VECTOR(offset_width_c - 1 DOWNTO 0); -- cache address offset
     ofs_ext : STD_ULOGIC_VECTOR(offset_width_c DOWNTO 0); -- bus address offset
+    wb_tag : STD_ULOGIC_VECTOR(tag_width_c - 1 DOWNTO 0);
+    flush_idx : STD_ULOGIC_VECTOR(index_width_c - 1 DOWNTO 0);
+    wb_flush : STD_ULOGIC;
   END RECORD;
   SIGNAL ctrl, ctrl_nxt : ctrl_t;
 
@@ -131,6 +136,9 @@ BEGIN
       ctrl.tag_idx <= (OTHERS => '0');
       ctrl.ofs_int <= (OTHERS => '0');
       ctrl.ofs_ext <= (OTHERS => '0');
+      ctrl.wb_tag <= (OTHERS => '0');
+      ctrl.flush_idx <= (OTHERS => '0');
+      ctrl.wb_flush <= '0';
     ELSIF rising_edge(clk_i) THEN
       ctrl <= ctrl_nxt;
     END IF;
@@ -148,10 +156,15 @@ BEGIN
     ctrl_nxt.tag_idx <= ctrl.tag_idx;
     ctrl_nxt.ofs_int <= ctrl.ofs_int;
     ctrl_nxt.ofs_ext <= ctrl.ofs_ext;
+    ctrl_nxt.wb_tag <= ctrl.wb_tag;
+    ctrl_nxt.flush_idx <= ctrl.flush_idx;
+    ctrl_nxt.wb_flush <= ctrl.wb_flush;
 
     -- cache access defaults --
     cache_o.cmd_clr <= '0';
     cache_o.cmd_new <= '0';
+    cache_o.cmd_dirty_set <= '0';
+    cache_o.cmd_dirty_clr <= '0';
     cache_o.addr <= host_req_i.addr;
     cache_o.we <= (OTHERS => '0');
     cache_o.data <= host_req_i.data;
