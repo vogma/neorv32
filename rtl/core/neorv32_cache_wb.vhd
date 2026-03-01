@@ -189,7 +189,12 @@ BEGIN
         -- ------------------------------------------------------------
         ctrl_nxt.bus_err <= '0'; -- reset bus error flag
         IF (ctrl.buf_syn = '1') THEN -- pending sync request
-          ctrl_nxt.state <= S_CLEAR;
+          IF (READ_ONLY) THEN
+            ctrl_nxt.state <= S_CLEAR;
+          ELSE
+            ctrl_nxt.state <= S_FLUSH_SCAN;
+            ctrl_nxt.flush_idx <= (OTHERS => '0');
+          END IF;
         ELSIF (host_req_i.stb = '1') OR (ctrl.buf_req = '1') THEN -- (pending) access request
           IF (unsigned(host_req_i.addr(31 DOWNTO 28)) >= unsigned(UC_BEGIN)) OR (host_req_i.amo = '1') THEN
             ctrl_nxt.buf_dir <= '1'; -- uncached address space access / atomic operation
@@ -218,7 +223,13 @@ BEGIN
           END IF;
         ELSE -- cache MISS
           IF (host_req_i.rw = '0') OR READ_ONLY THEN -- read miss
-            ctrl_nxt.state <= S_DOWNLOAD_START; -- get block from main memory
+            IF ((NOT READ_ONLY) AND (valid_rd = '1') AND (dirty_rd = '1')) THEN -- cacheline which is about to be overwritten is dirty, write-back before download
+              ctrl_nxt.wb_tag <= tag_rd(tag_width_c - 1 DOWNTO 0); -- save old tag
+              ctrl_nxt.wb_flush <= '0';
+              ctrl_nxt.state <= S_WRITEBACK_SETUP;
+            ELSE
+              ctrl_nxt.state <= S_DOWNLOAD_START; -- get block from main memory
+            END IF;
           ELSE -- write miss
             ctrl_nxt.state <= S_DIRECT_REQ; -- write-through
           END IF;
@@ -306,6 +317,38 @@ BEGIN
           END IF;
         ELSE -- single transfers only
           ctrl_nxt.state <= S_IDLE;
+        END IF;
+
+      WHEN S_WRITEBACK_SETUP =>
+        cache_o.addr <= ctrl.tag_idx & ctrl.ofs_int & "00";
+        ctrl_nxt.state <= S_WRITEBACK_SEND;
+
+      WHEN S_WRITEBACK_SEND =>
+        bus_req_o.stb <= '1'; -- let's go 
+        bus_req_o.rw <= '1'; -- write
+        bus_req_o.lock <= '1'; -- hold the bus for the full line
+        bus_req_o.ben <= (OTHERS => '1'); -- full word write
+        bus_req_o.data <= cache_i.data;
+        bus_req_o.addr <= ctrl.wb_tag & ctrl.tag_idx(index_width_c - 1 DOWNTO 0) & ctrl.ofs_int & "00";
+        ctrl_nxt.state <= S_WRITEBACK_WAIT;
+
+      WHEN S_WRITEBACK_WAIT =>
+        bus_req_o.lock <= '1';
+        bus_req_o.addr <= ctrl.wb_tag & ctrl.tag_idx(index_width_c - 1 DOWNTO 0) & ctrl.ofs_int & "00";
+        cache_o.addr <= ctrl.tag_idx & ctrl.ofs_int & "00"; 
+        IF (bus_rsp_i.ack = '1') THEN
+          ctrl_nxt.bus_err <= ctrl.bus_err OR bus_rsp_i.err; -- accumulate errors
+          IF (and_reduce_f(ctrl.ofs_int) = '1') THEN -- last word
+            cache_o.cmd_dirty_clr <= '1';
+            IF (ctrl.wb_flush = '0') THEN
+              ctrl_nxt.state <= S_DOWNLOAD_START;
+            ELSE
+              ctrl_nxt.state <= S_FLUSH_SCAN;
+            END IF;
+          ELSE
+            ctrl_nxt.ofs_int <= STD_ULOGIC_VECTOR(unsigned(ctrl.ofs_int) + 1); -- increment cacheline word offset
+            ctrl_nxt.state <= S_WRITEBACK_SETUP;
+          END IF;
         END IF;
 
       WHEN S_DONE => -- any error during block update?
