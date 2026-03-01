@@ -98,7 +98,7 @@ ARCHITECTURE neorv32_cache_rtl OF neorv32_cache_wb IS
 
   -- control arbiter --
   TYPE state_t IS (
-    S_IDLE, S_CHECK, S_DIRECT_REQ, S_DIRECT_RSP, S_CLEAR, S_DOWNLOAD_START, S_DOWNLOAD_WAIT, S_DOWNLOAD_RUN, S_DONE, S_DELAY
+    S_IDLE, S_CHECK, S_DIRECT_REQ, S_DIRECT_RSP, S_CLEAR, S_DOWNLOAD_START, S_DOWNLOAD_WAIT, S_DOWNLOAD_RUN, S_DONE, S_DELAY, S_WRITEBACK_SETUP, S_WRITEBACK_SEND, S_WRITEBACK_WAIT, S_FLUSH_SCAN, S_FLUSH_CHECK
   );
   TYPE ctrl_t IS RECORD
     state : state_t; -- state machine
@@ -120,6 +120,9 @@ ARCHITECTURE neorv32_cache_rtl OF neorv32_cache_wb IS
   SIGNAL valid_rd : STD_ULOGIC;
   SIGNAL tag_reg : STD_ULOGIC_VECTOR(tag_width_c - 1 DOWNTO 0);
   SIGNAL tag_rd : STD_ULOGIC_VECTOR(31 DOWNTO 0);
+
+  SIGNAL dirty : STD_ULOGIC_VECTOR(NUM_BLOCKS - 1 DOWNTO 0);
+  SIGNAL dirty_rd : STD_ULOGIC;
 
 BEGIN
 
@@ -209,7 +212,9 @@ BEGIN
             ctrl_nxt.state <= S_IDLE;
           ELSE -- write to main memory and also to the cache
             cache_o.we <= host_req_i.ben;
-            ctrl_nxt.state <= S_DIRECT_REQ; -- write-through
+            cache_o.cmd_dirty_set <= '1';
+            host_rsp_o.ack <= '1';
+            ctrl_nxt.state <= S_IDLE; -- write-back
           END IF;
         ELSE -- cache MISS
           IF (host_req_i.rw = '0') OR READ_ONLY THEN -- read miss
@@ -347,13 +352,22 @@ BEGIN
       IF (rstn_i = '0') THEN
         valid <= (OTHERS => '0');
         valid_rd <= '0';
+        dirty <= (OTHERS => '0');
+        dirty_rd <= '0';
       ELSIF rising_edge(clk_i) THEN
         IF (cache_o.cmd_clr = '1') THEN -- invalidate entire cache
           valid <= (OTHERS => '0');
+          dirty <= (OTHERS => '0');
         ELSIF (cache_o.cmd_new = '1') THEN -- make indexed block valid
           valid(to_integer(unsigned(cache_o.addr(31 - tag_width_c DOWNTO 2 + offset_width_c)))) <= '1';
+          dirty(to_integer(unsigned(cache_o.addr(31 - tag_width_c DOWNTO 2 + offset_width_c)))) <= '0';
+        ELSIF (cache_o.cmd_dirty_set = '1') THEN -- mark indexed block dirty
+          dirty(to_integer(unsigned(cache_o.addr(31 - tag_width_c DOWNTO 2 + offset_width_c)))) <= '1';
+        ELSIF (cache_o.cmd_dirty_clr = '1') THEN -- mark indexed block clean
+          dirty(to_integer(unsigned(cache_o.addr(31 - tag_width_c DOWNTO 2 + offset_width_c)))) <= '0';
         END IF;
         valid_rd <= valid(to_integer(unsigned(cache_o.addr(31 - tag_width_c DOWNTO 2 + offset_width_c))));
+        dirty_rd <= dirty(to_integer(unsigned(cache_o.addr(31 - tag_width_c DOWNTO 2 + offset_width_c))));
       END IF;
     END PROCESS status_memory;
   END GENERATE;
@@ -365,15 +379,23 @@ BEGIN
     BEGIN
       IF (rstn_i = '0') THEN
         valid(0) <= '0';
+        dirty(0) <= '0';
       ELSIF rising_edge(clk_i) THEN
         IF (cache_o.cmd_clr = '1') THEN -- invalidate
           valid(0) <= '0';
+          dirty(0) <= '0';
         ELSIF (cache_o.cmd_new = '1') THEN -- make valid
           valid(0) <= '1';
+          dirty(0) <= '0';
+        ELSIF (cache_o.cmd_dirty_set = '1') THEN -- mark indexed block dirty
+          dirty(0) <= '1';
+        ELSIF (cache_o.cmd_dirty_clr = '1') THEN -- mark indexed block clean
+          dirty(0) <= '0';
         END IF;
       END IF;
     END PROCESS status_memory;
     valid_rd <= valid(0);
+    dirty_rd <= dirty(0);
   END GENERATE;
   -- Cache Hit Check ------------------------------------------------------------------------
   -- -------------------------------------------------------------------------------------------
