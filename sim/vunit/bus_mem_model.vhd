@@ -28,7 +28,11 @@ entity bus_mem_model is
     force_err_i    : in  std_ulogic;
     -- direct inspection (bypasses cache) --
     inspect_addr_i : in  std_ulogic_vector(31 downto 0);
-    inspect_data_o : out std_ulogic_vector(31 downto 0)
+    inspect_data_o : out std_ulogic_vector(31 downto 0);
+    -- direct initialization (testbench seeds memory bypassing cache) --
+    init_we_i      : in  std_ulogic;
+    init_addr_i    : in  std_ulogic_vector(31 downto 0);
+    init_data_i    : in  std_ulogic_vector(31 downto 0)
   );
 end entity;
 
@@ -64,7 +68,16 @@ begin
       pipe(0).data  <= (others => '0');
       pipe(0).err   <= '0';
 
-      if bus_req_i.stb = '1' then
+      -- direct init port (used before test interacts with cache) --
+      if init_we_i = '1' then
+        addr_v := to_integer(unsigned(init_addr_i(index_size_f(MEM_SIZE)-1 downto 0)));
+        addr_v := (addr_v / 4) * 4;
+        for b in 0 to 3 loop
+          if (addr_v + b) < MEM_SIZE then
+            mem(addr_v + b) <= init_data_i(b*8+7 downto b*8);
+          end if;
+        end loop;
+      elsif bus_req_i.stb = '1' then
         addr_v := to_integer(unsigned(bus_req_i.addr(index_size_f(MEM_SIZE)-1 downto 0)));
         -- ensure word-aligned base --
         addr_v := (addr_v / 4) * 4;

@@ -47,6 +47,10 @@ ARCHITECTURE tb OF tb_cache IS
   SIGNAL inspect_addr : STD_ULOGIC_VECTOR(31 DOWNTO 0) := (OTHERS => '0');
   SIGNAL inspect_data : STD_ULOGIC_VECTOR(31 DOWNTO 0);
 
+  SIGNAL init_we   : STD_ULOGIC := '0';
+  SIGNAL init_addr : STD_ULOGIC_VECTOR(31 DOWNTO 0) := (OTHERS => '0');
+  SIGNAL init_data : STD_ULOGIC_VECTOR(31 DOWNTO 0) := (OTHERS => '0');
+
   -- ======================================================================== --
   -- Helper procedures                                                        --
   -- ======================================================================== --
@@ -77,6 +81,37 @@ ARCHITECTURE tb OF tb_cache IS
     req.rw <= '0';
     WAIT UNTIL rising_edge(clk_s);
     req.stb <= '0';
+    -- wait for ack --
+    LOOP
+      WAIT UNTIL rising_edge(clk_s);
+      IF rsp.ack = '1' THEN
+        data := rsp.data;
+        err := rsp.err;
+        RETURN;
+      END IF;
+    END LOOP;
+  END PROCEDURE;
+
+  -- Issue an atomic (AMO) cache read — bypasses cache --
+  PROCEDURE cache_read_amo(
+    SIGNAL clk_s : IN STD_ULOGIC;
+    SIGNAL req : INOUT bus_req_t;
+    SIGNAL rsp : IN bus_rsp_t;
+    addr : IN STD_ULOGIC_VECTOR(31 DOWNTO 0);
+    data : OUT STD_ULOGIC_VECTOR(31 DOWNTO 0);
+    err : OUT STD_ULOGIC
+  ) IS
+  BEGIN
+    WAIT UNTIL rising_edge(clk_s);
+    req <= req_terminate_c;
+    req.addr <= addr;
+    req.ben <= "1111";
+    req.stb <= '1';
+    req.rw <= '0';
+    req.amo <= '1';
+    WAIT UNTIL rising_edge(clk_s);
+    req.stb <= '0';
+    req.amo <= '0';
     -- wait for ack --
     LOOP
       WAIT UNTIL rising_edge(clk_s);
@@ -144,6 +179,24 @@ ARCHITECTURE tb OF tb_cache IS
     data := idata;
   END PROCEDURE;
 
+  -- Seed memory model directly (bypasses cache) --
+  PROCEDURE mem_seed(
+    SIGNAL clk_s  : IN  STD_ULOGIC;
+    SIGNAL we     : OUT STD_ULOGIC;
+    SIGNAL addr_s : OUT STD_ULOGIC_VECTOR(31 DOWNTO 0);
+    SIGNAL data_s : OUT STD_ULOGIC_VECTOR(31 DOWNTO 0);
+    addr : IN STD_ULOGIC_VECTOR(31 DOWNTO 0);
+    data : IN STD_ULOGIC_VECTOR(31 DOWNTO 0)
+  ) IS
+  BEGIN
+    WAIT UNTIL rising_edge(clk_s);
+    we     <= '1';
+    addr_s <= addr;
+    data_s <= data;
+    WAIT UNTIL rising_edge(clk_s);
+    we     <= '0';
+  END PROCEDURE;
+
 BEGIN
 
   -- ======================================================================== --
@@ -187,7 +240,10 @@ BEGIN
       bus_rsp_o => bus_rsp,
       force_err_i => force_err,
       inspect_addr_i => inspect_addr,
-      inspect_data_o => inspect_data
+      inspect_data_o => inspect_data,
+      init_we_i      => init_we,
+      init_addr_i    => init_addr,
+      init_data_i    => init_data
     );
 
   -- Monitor xbus traffic
@@ -241,9 +297,8 @@ BEGIN
       wr_data := x"0000000F";
       test_addr := x"00000000";
 
-      -- Seed memory via write-through
-      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
-      check_equal(rd_err, '0', "write error");
+      -- Seed memory directly (bypass cache)
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
 
       -- First read: miss -> block fill
       cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
@@ -269,10 +324,9 @@ BEGIN
       wr_data := x"0000000F";
       test_addr := x"00000000";
 
-      -- Seed all words in one block via write-through
+      -- Seed all words in one block directly
       FOR i IN 0 TO BLOCK_SIZE/4 - 1 LOOP
-        cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
-        check_equal(rd_err, '0', "write error");
+        mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
         test_addr := test_addr + 4;
       END LOOP;
       test_addr := x"00000000";
@@ -366,8 +420,8 @@ BEGIN
     IF run("byte_write") THEN
       test_addr := x"00000000";
 
-      -- Write full word to memory
-      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), STD_ULOGIC_VECTOR'(x"12345678"), "1111", rd_err);
+      -- Seed full word to memory directly
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), STD_ULOGIC_VECTOR'(x"12345678"));
 
       -- Overwrite only byte 2 (bits 23:16) via partial ben
       cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), STD_ULOGIC_VECTOR'(x"FFFFFFFF"), "0100", rd_err);
@@ -392,15 +446,13 @@ BEGIN
       test_addr := x"00000000"; -- addr A: index 0, tag 0
       wr_data := x"AABBCCDD";
 
-      -- Seed addr A in memory via write-through
-      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
-      check_equal(rd_err, '0', "write A error");
+      -- Seed addr A in memory directly
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
 
-      -- Seed addr B in memory via write-through
+      -- Seed addr B in memory directly
       test_addr := to_unsigned(NUM_BLOCKS * BLOCK_SIZE, 32); -- addr B: index 0, tag 1
       wr_data := x"11223344";
-      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
-      check_equal(rd_err, '0', "write B error");
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
 
       -- Read addr A -> miss, fills cache line
       test_addr := x"00000000";
@@ -450,9 +502,8 @@ BEGIN
       FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
         test_addr := to_unsigned(i * BLOCK_SIZE, 32);
         wr_data := STD_ULOGIC_VECTOR(to_unsigned(16#A0A0# + i, 32));
-        -- Seed memory via write-through
-        cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
-        check_equal(rd_err, '0', "seed write error line " & INTEGER'image(i));
+        -- Seed memory directly
+        mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
         -- Read to fill cache line
         cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
         check_equal(rd_err, '0', "fill read error line " & INTEGER'image(i));
@@ -480,6 +531,259 @@ BEGIN
         check_equal(rd_err, '0', "post-fence read error line " & INTEGER'image(i));
         check_equal(rd_data, wr_data, "post-fence data mismatch line " & INTEGER'image(i));
       END LOOP;
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- Group 5: uncached_read_write
+    -- Read/write to address in uncached region (addr >= UC_BEGIN<<28,
+    -- e.g. 0xF0000000). Verify request goes through (ack received),
+    -- no cache fill. Memory model wraps address to low 12 bits.
+    -- ----------------------------------------------------------------
+    IF run("uncached_read_write") THEN
+      test_addr := x"00000000";
+
+      -- Seed memory at physical address 0 directly
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), STD_ULOGIC_VECTOR'(x"DEADBEEF"));
+
+      -- Seed memory at physical address 4
+      test_addr := x"00000004";
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), STD_ULOGIC_VECTOR'(x"12345678"));
+
+      -- Uncached read from 0xF0000000 (wraps to physical byte 0)
+      test_addr := x"F0000000";
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "uncached read should go to bus");
+      check_equal(rd_err, '0', "uncached read error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"DEADBEEF"), "uncached read data mismatch");
+
+      -- Second uncached read: should still go to bus (no cache fill)
+      wait_cycles(clk, 2);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "second uncached read should still go to bus (no fill)");
+      check_equal(rd_err, '0', "second uncached read error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"DEADBEEF"), "second uncached read data mismatch");
+
+      -- Uncached write to 0xF0000004 (wraps to physical byte 4)
+      test_addr := x"F0000004";
+      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), STD_ULOGIC_VECTOR'(x"CAFEBABE"), "1111", rd_err);
+      check_equal(rd_err, '0', "uncached write error");
+
+      -- Verify write reached memory
+      mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR'(x"00000004"), rd_data);
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"CAFEBABE"), "uncached write: data should be in memory");
+
+      -- Uncached read-back from 0xF0000004
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "uncached read-back should go to bus");
+      check_equal(rd_err, '0', "uncached read-back error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"CAFEBABE"), "uncached read-back data mismatch");
+
+      -- Verify no cache pollution: cached read to 0x00000000 should miss
+      test_addr := x"00000000";
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "cached read after uncached ops should be a miss");
+      check_equal(rd_err, '0', "cached read error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"DEADBEEF"), "cached read data mismatch");
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- Group 5: atomic_bypass
+    -- Issue a read with amo='1' to a cacheable address. Verify the
+    -- access bypasses the cache (goes to bus) and does not disturb
+    -- existing cached state.
+    -- ----------------------------------------------------------------
+    IF run("atomic_bypass") THEN
+      test_addr := x"00000000";
+      wr_data := x"AABBCCDD";
+
+      -- Seed memory directly
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
+
+      -- Normal read: miss -> fills cache line
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "first read should be a miss");
+      check_equal(rd_err, '0', "first read error");
+      check_equal(rd_data, wr_data, "first read data mismatch");
+
+      -- Normal re-read: hit (line is cached)
+      wait_cycles(clk, 2);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '0', "re-read should be a hit");
+      check_equal(rd_err, '0', "re-read error");
+      check_equal(rd_data, wr_data, "re-read data mismatch");
+
+      -- AMO read: bypasses cache, goes to bus
+      cache_read_amo(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "AMO read should bypass cache (go to bus)");
+      check_equal(rd_err, '0', "AMO read error");
+      check_equal(rd_data, wr_data, "AMO read data mismatch");
+
+      -- Normal read after AMO: should still be a hit (AMO didn't invalidate)
+      wait_cycles(clk, 2);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '0', "read after AMO should still be a hit");
+      check_equal(rd_err, '0', "read after AMO error");
+      check_equal(rd_data, wr_data, "read after AMO data mismatch");
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- Group 6: bus_error_during_fill
+    -- Set force_err='1' on memory model. Issue a read (miss -> fill).
+    -- Bus errors are accumulated; S_DONE sees bus_err='1', returns
+    -- err to host WITHOUT validating the cache line.
+    -- Deassert force_err. Re-read same address: should be a miss
+    -- (line was not validated). Verify second read succeeds.
+    -- ----------------------------------------------------------------
+    IF run("bus_error_during_fill") THEN
+      test_addr := x"00000000";
+      wr_data := x"DEADBEEF";
+
+      -- Seed memory directly
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
+
+      -- Fence to clear cache
+      cache_fence(clk, host_req);
+      wait_cycles(clk, 2);
+
+      -- Enable error injection
+      force_err <= '1';
+
+      -- Read triggers miss -> fill; all bus responses carry err
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(rd_err, '1', "fill with bus error should propagate err to host");
+
+      -- Disable error injection
+      force_err <= '0';
+      wait_cycles(clk, 2);
+
+      -- Re-read: line was NOT validated, so this should be a miss
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "read after failed fill should be a miss");
+      check_equal(rd_err, '0', "second read should succeed");
+      check_equal(rd_data, wr_data, "second read data mismatch");
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- Group 6: bus_error_on_write
+    -- Set force_err='1'. Issue a write (write-through to bus).
+    -- Verify err='1' returned to host. Deassert force_err, verify
+    -- a subsequent write succeeds.
+    -- ----------------------------------------------------------------
+    IF run("bus_error_on_write") THEN
+      test_addr := x"00000000";
+      wr_data := x"CAFEBABE";
+
+      -- Enable error injection
+      force_err <= '1';
+
+      -- Write goes write-through to bus; memory model returns err
+      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
+      check_equal(rd_err, '1', "write with bus error should propagate err to host");
+
+      -- Disable error injection
+      force_err <= '0';
+      wait_cycles(clk, 2);
+
+      -- Subsequent write should succeed
+      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
+      check_equal(rd_err, '0', "write after clearing force_err should succeed");
+
+      -- Verify data reached memory
+      mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR(test_addr), rd_data);
+      check_equal(rd_data, wr_data, "write-through data should be in memory");
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- Group 7: fence_during_pending_request
+    -- Pre-fill a cache line so it hits. Then drive fence and read
+    -- request on the SAME clock edge. The FSM must process the fence
+    -- first (S_CLEAR) before the read. The read should therefore be
+    -- a miss.
+    -- ----------------------------------------------------------------
+    IF run("fence_during_pending_request") THEN
+      test_addr := x"00000000";
+      wr_data := x"AABBCCDD";
+
+      -- Seed memory directly, then fill cache line via read
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(rd_err, '0', "fill read error");
+
+      -- Verify line is cached (hit)
+      wait_cycles(clk, 2);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '0', "pre-fence read should be a hit");
+      check_equal(rd_err, '0', "pre-fence read error");
+      check_equal(rd_data, wr_data, "pre-fence read data mismatch");
+
+      -- Drive fence one cycle before stb so that buf_syn is registered
+      -- when stb arrives. On that edge the FSM sees both buf_syn='1'
+      -- (registered) and host_req_i.stb='1' (live); fence must win.
+      WAIT UNTIL rising_edge(clk);
+      host_req <= req_terminate_c;
+      host_req.fence <= '1';
+      -- Next cycle: deassert fence, assert read request
+      WAIT UNTIL rising_edge(clk);
+      host_req.fence <= '0';
+      host_req.addr <= STD_ULOGIC_VECTOR(test_addr);
+      host_req.ben <= "1111";
+      host_req.stb <= '1';
+      host_req.rw <= '0';
+      WAIT UNTIL rising_edge(clk);
+      host_req.stb <= '0';
+
+      -- Wait for ack from the read
+      LOOP
+        WAIT UNTIL rising_edge(clk);
+        IF host_rsp.ack = '1' THEN
+          rd_data := host_rsp.data;
+          rd_err := host_rsp.err;
+          EXIT;
+        END IF;
+      END LOOP;
+
+      -- Read must be a miss: fence invalidated the line before the read was processed
+      check_equal(bus_activity, '1', "read after simultaneous fence should be a miss");
+      check_equal(rd_err, '0', "read error");
+      check_equal(rd_data, wr_data, "read data mismatch");
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- Group 8: sequential_fill_and_verify
+    -- Write NUM_BLOCKS distinct values to different cache lines.
+    -- Read them all back (misses -> fills). Read again (all hits).
+    -- Exercises full index range and confirms no inter-line corruption.
+    -- ----------------------------------------------------------------
+    IF run("sequential_fill_and_verify") THEN
+
+      -- Seed memory with distinct values at each cache-line index
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        wr_data := x"A000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+        mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
+      END LOOP;
+
+      -- Read pass 1: every line should be a miss (fill from memory)
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        wr_data := x"A000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+        cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+        check_equal(bus_activity, '1', "pass 1: line " & INTEGER'image(i) & " should be a miss");
+        check_equal(rd_err, '0', "pass 1: read error line " & INTEGER'image(i));
+        check_equal(rd_data, wr_data, "pass 1: data mismatch line " & INTEGER'image(i));
+      END LOOP;
+
+      -- Read pass 2: every line should be a hit
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        wr_data := x"A000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+        wait_cycles(clk, 2);
+        cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+        check_equal(bus_activity, '0', "pass 2: line " & INTEGER'image(i) & " should be a hit");
+        check_equal(rd_err, '0', "pass 2: read error line " & INTEGER'image(i));
+        check_equal(rd_data, wr_data, "pass 2: data mismatch line " & INTEGER'image(i));
+      END LOOP;
+
     END IF;
 
     test_runner_cleanup(runner);
