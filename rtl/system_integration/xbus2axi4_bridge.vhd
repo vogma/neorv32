@@ -1,8 +1,7 @@
 -- ================================================================================ --
 -- NEORV32 SoC - XBUS to AXI4-Compatible Bridge                                     --
 -- -------------------------------------------------------------------------------- --
--- This bridge supports single read/write transfers and read-bursts.                --
--- [IMPORTANT] Write-bursts are not supported yet!                                  --
+-- This bridge supports single read/write transfers and read/write bursts.          --
 -- -------------------------------------------------------------------------------- --
 -- The NEORV32 RISC-V Processor - https://github.com/stnolting/neorv32              --
 -- Copyright (c) NEORV32 contributors.                                              --
@@ -77,6 +76,13 @@ architecture xbus2axi4_bridge_rtl of xbus2axi4_bridge is
   signal state : std_ulogic_vector(1 downto 0);
   signal arvalid, awvalid, wvalid, xbus_rd_ack, xbus_rd_err, xbus_wr_ack, xbus_wr_err : std_ulogic;
   constant blen_c : std_logic_vector(7 downto 0) := std_logic_vector(to_unsigned((BURST_LEN/4)-1, 8));
+  signal wr_burst_addr : std_logic_vector(31 downto 0);
+  signal wr_burst_data : std_logic_vector(31 downto 0);
+  signal wr_burst_strb : std_logic_vector(3 downto 0);
+  signal wr_beat_cnt   : unsigned(7 downto 0);
+  signal wr_all_sent   : std_ulogic;
+  signal wr_burst_ack  : std_ulogic;
+  signal wr_burst_err  : std_ulogic;
 
 begin
 
@@ -84,10 +90,15 @@ begin
   arbiter: process(resetn, clk)
   begin
     if (resetn = '0') then
-      arvalid <= '0';
-      awvalid <= '0';
-      wvalid  <= '0';
-      state   <= (others => '0');
+      arvalid       <= '0';
+      awvalid       <= '0';
+      wvalid        <= '0';
+      state         <= (others => '0');
+      wr_burst_addr <= (others => '0');
+      wr_burst_data <= (others => '0');
+      wr_burst_strb <= (others => '0');
+      wr_beat_cnt   <= (others => '0');
+      wr_all_sent   <= '0';
     elsif rising_edge(clk) then
       -- AXI handshake --
       arvalid <= arvalid and std_ulogic(not m_axi_arready);
@@ -103,8 +114,19 @@ begin
           wvalid  <= '0';
           if (xbus_stb_i = '1') then -- access request
             if BURST_EN and (xbus_cti_i = "010") then -- incrementing address burst access
-              arvalid <= '1'; -- read-only!
-              state   <= "10";
+              if (xbus_we_i = '0') then -- read burst
+                arvalid <= '1';
+                state   <= "10";
+              else -- write burst
+                awvalid       <= '1';
+                wvalid        <= '1';
+                wr_burst_addr <= std_logic_vector(xbus_adr_i);
+                wr_burst_data <= std_logic_vector(xbus_dat_i);
+                wr_burst_strb <= std_logic_vector(xbus_sel_i);
+                wr_beat_cnt   <= (others => '0');
+                wr_all_sent   <= '0';
+                state         <= "11";
+              end if;
             else -- single access (read/write)
               arvalid <= not xbus_we_i;
               awvalid <= xbus_we_i;
@@ -125,6 +147,26 @@ begin
             state <= (others => '0');
           end if;
 
+        when "11" => -- burst write transfer in progress
+        -- ------------------------------------------------------------
+          if (wr_all_sent = '0') then
+            -- latch next beat data when cache presents it and previous beat was accepted
+            if (xbus_stb_i = '1') and (wvalid = '0') then
+              wr_burst_data <= std_logic_vector(xbus_dat_i);
+              wr_burst_strb <= std_logic_vector(xbus_sel_i);
+              wvalid        <= '1';
+              wr_beat_cnt   <= wr_beat_cnt + 1;
+            end if;
+            -- detect last beat accepted by AXI slave
+            if (wr_beat_cnt = unsigned(blen_c)) and (wvalid = '1') and (m_axi_wready = '1') then
+              wr_all_sent <= '1';
+            end if;
+          end if;
+          -- wait for write response to complete transaction
+          if (m_axi_bvalid = '1') then
+            state <= (others => '0');
+          end if;
+
         when others => -- undefined
         -- ------------------------------------------------------------
           state <= (others => '0');
@@ -135,7 +177,7 @@ begin
 
   -- AXI read address channel --
   m_axi_araddr  <= std_logic_vector(xbus_adr_i);
-  m_axi_arlen   <= blen_c when BURST_EN and (state(1) = '1') else (others => '0'); -- burst length
+  m_axi_arlen   <= blen_c when BURST_EN and (state = "10") else (others => '0'); -- burst length
   m_axi_arsize  <= "010"; -- 4 bytes per transfer
   m_axi_arburst <= "01"; -- incrementing bursts only
   m_axi_arcache <= "0011"; -- recommended by Vivado
@@ -149,8 +191,8 @@ begin
   xbus_dat_o    <= std_ulogic_vector(m_axi_rdata);
 
   -- AXI write address channel --
-  m_axi_awaddr  <= std_logic_vector(xbus_adr_i);
-  m_axi_awlen   <= (others => '0'); -- burst length = 1
+  m_axi_awaddr  <= wr_burst_addr when (state = "11") else std_logic_vector(xbus_adr_i);
+  m_axi_awlen   <= blen_c when (state = "11") else (others => '0');
   m_axi_awsize  <= "010"; -- 4 bytes per transfer
   m_axi_awburst <= "01"; -- incrementing bursts only
   m_axi_awcache <= "0011"; -- recommended by Vivado
@@ -158,18 +200,23 @@ begin
   m_axi_awvalid <= std_logic(awvalid);
 
   -- AXI write data channel --
-  m_axi_wdata   <= std_logic_vector(xbus_dat_i);
-  m_axi_wstrb   <= std_logic_vector(xbus_sel_i);
-  m_axi_wlast   <= '1'; -- single transfers only; so this is also the last word
+  m_axi_wdata   <= wr_burst_data when (state = "11") else std_logic_vector(xbus_dat_i);
+  m_axi_wstrb   <= wr_burst_strb when (state = "11") else std_logic_vector(xbus_sel_i);
+  m_axi_wlast   <= '1' when (state /= "11") or (wr_beat_cnt = unsigned(blen_c)) else '0';
   m_axi_wvalid  <= std_logic(wvalid);
 
   -- AXI write response channel --
   m_axi_bready  <= '1'; -- always ready for write response
-  xbus_wr_ack   <= '1' when (m_axi_bvalid = '1') and (m_axi_bresp(1) = '0') else '0'; -- OKAY(00)/EXOKAY(01)
-  xbus_wr_err   <= '1' when (m_axi_bvalid = '1') and (m_axi_bresp(1) = '1') else '0'; -- SLVERR(10)/DECERR(11)
+  xbus_wr_ack   <= '1' when (state = "01") and (m_axi_bvalid = '1') and (m_axi_bresp(1) = '0') else '0';
+  xbus_wr_err   <= '1' when (state = "01") and (m_axi_bvalid = '1') and (m_axi_bresp(1) = '1') else '0';
+
+  -- burst write ack/err --
+  wr_burst_ack  <= '1' when (state = "11") and (wr_all_sent = '0') and (wvalid = '1') and (m_axi_wready = '1') and (wr_beat_cnt /= unsigned(blen_c)) else
+                   '1' when (state = "11") and (m_axi_bvalid = '1') and (m_axi_bresp(1) = '0') else '0';
+  wr_burst_err  <= '1' when (state = "11") and (m_axi_bvalid = '1') and (m_axi_bresp(1) = '1') else '0';
 
   -- XBUS response --
-  xbus_ack_o    <= xbus_rd_ack or xbus_wr_ack;
-  xbus_err_o    <= xbus_rd_err or xbus_wr_err;
+  xbus_ack_o    <= xbus_rd_ack or xbus_wr_ack or wr_burst_ack;
+  xbus_err_o    <= xbus_rd_err or xbus_wr_err or wr_burst_err;
 
 end architecture;

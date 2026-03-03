@@ -30,6 +30,9 @@ ARCHITECTURE tb OF tb_cache IS
 
   CONSTANT CLK_PERIOD : TIME := 10 ns;
 
+  -- Memory must cover full cache address space plus one extra block for eviction tests --
+  CONSTANT MEM_BYTES : NATURAL := (NUM_BLOCKS + 1) * BLOCK_SIZE;
+
   -- DUT signals --
   SIGNAL clk : STD_ULOGIC := '0';
   SIGNAL rstn : STD_ULOGIC := '0';
@@ -230,8 +233,8 @@ BEGIN
   -- ======================================================================== --
   mem : ENTITY neorv32.bus_mem_model
     GENERIC MAP(
-      MEM_SIZE => 4096,
-      LATENCY => 1
+      MEM_SIZE => MEM_BYTES,
+      LATENCY => 1  
     )
     PORT MAP(
       clk_i => clk,
@@ -347,44 +350,10 @@ BEGIN
     END IF;
 
     -- ----------------------------------------------------------------
-    -- Group 2: write_hit
-    -- Pre-fill a cache line via read (miss -> fill).
-    -- Write new data to same address (write-through: updates cache
-    -- AND memory). Re-read: verify cache returns updated data.
-    -- mem_inspect: verify memory also has the updated data.
+    -- Group 2: write_hit (DISABLED - tests write-through behaviour)
     -- ----------------------------------------------------------------
-    IF run("write_hit") THEN
-      wr_data := x"0000000F";
-      test_addr := x"00000000";
-
-      -- Pre-fill cache line via read (miss -> fill)
-      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
-      check_equal(bus_activity, '1', "pre-fill should be a miss");
-      check_equal(rd_err, '0', "read error");
-
-      -- Verify entire block is now cached
-      FOR i IN 1 TO BLOCK_SIZE/4 - 1 LOOP
-        test_addr := test_addr + 4;
-        cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
-        check_equal(bus_activity, '0', "block word " & INTEGER'image(i) & " should be a hit");
-        check_equal(rd_err, '0', "read error");
-      END LOOP;
-
-      test_addr := x"00000000";
-
-      -- Write to cached address (write-through)
-      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
-
-      -- Re-read: cache should return updated data (hit)
-      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
-      check_equal(bus_activity, '0', "re-read after write should be a hit");
-      check_equal(rd_err, '0', "read error");
-      check_equal(rd_data, wr_data, "cache read data mismatch");
-
-      -- Verify write-through: data must also be in memory
-      mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR(test_addr), rd_data);
-      check_equal(rd_data, wr_data, "write-through: data should be in memory");
-    END IF;
+    -- IF run("write_hit") THEN
+    -- END IF;
 
     -- ----------------------------------------------------------------
     -- Group 2: write_miss
@@ -786,10 +755,316 @@ BEGIN
 
     END IF;
 
+    -- ================================================================
+    -- Write-back specific tests
+    -- ================================================================
+
+    -- ----------------------------------------------------------------
+    -- dirty_eviction
+    -- Write to a cached line (marks dirty). Read a different tag at
+    -- the same index -> dirty eviction (writeback to memory) then
+    -- fill. Verify written-back data appears in memory.
+    -- ----------------------------------------------------------------
+    IF run("dirty_eviction") THEN
+      test_addr := x"00000000"; -- addr A: index 0, tag 0
+      wr_data := x"AABBCCDD";
+
+      -- Seed addr A and addr B in memory
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
+      test_addr := to_unsigned(NUM_BLOCKS * BLOCK_SIZE, 32); -- addr B: index 0, tag 1
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), x"11223344");
+
+      -- Read addr A -> miss, fills cache line (clean)
+      test_addr := x"00000000";
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "read A: expected miss");
+      check_equal(rd_err, '0', "read A error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"AABBCCDD"), "read A data mismatch");
+
+      -- Write new data to addr A -> write hit, marks dirty, acks immediately
+      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), x"DEADBEEF", "1111", rd_err);
+      check_equal(rd_err, '0', "write A error");
+
+      -- Verify write hit did NOT go to bus (no bus traffic)
+      check_equal(bus_activity, '0', "write hit should not generate bus traffic");
+
+      -- Read addr A -> cache hit, returns new (dirty) data
+      wait_cycles(clk, 2);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '0', "read A after write: expected hit");
+      check_equal(rd_err, '0', "read A after write error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"DEADBEEF"), "read A after write data mismatch");
+
+      -- mem_inspect: memory should still have OLD data (not written back yet)
+      mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR'(x"00000000"), rd_data);
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"AABBCCDD"), "memory should have old data before eviction");
+
+      -- Read addr B -> miss on dirty line -> writeback A, then fill B
+      test_addr := to_unsigned(NUM_BLOCKS * BLOCK_SIZE, 32);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "read B: expected miss (triggers dirty eviction)");
+      check_equal(rd_err, '0', "read B error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"11223344"), "read B data mismatch");
+
+      -- mem_inspect: addr A should now have the dirty data (written back during eviction)
+      mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR'(x"00000000"), rd_data);
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"DEADBEEF"), "memory should have written-back data after eviction");
+
+      -- Read addr A -> miss (was evicted), re-fills from memory with written-back data
+      test_addr := x"00000000";
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "read A after eviction: expected miss");
+      check_equal(rd_err, '0', "read A after eviction error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"DEADBEEF"), "read A after eviction should return written-back data");
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- dirty_fence_flush
+    -- Fill all cache lines, write new data to each (marks dirty).
+    -- Issue fence -> flush scan writes back all dirty lines, then
+    -- invalidates. Verify written-back data in memory, re-reads miss.
+    -- ----------------------------------------------------------------
+    IF run("dirty_fence_flush") THEN
+
+      -- Seed memory and fill all cache lines via reads
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        wr_data := x"A000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+        mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
+        cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+        check_equal(rd_err, '0', "fill read error line " & INTEGER'image(i));
+      END LOOP;
+
+      -- Write new data to each line -> all marked dirty
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        wr_data := x"D000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+        cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
+        check_equal(rd_err, '0', "write error line " & INTEGER'image(i));
+      END LOOP;
+
+      -- Issue fence -> flushes all dirty lines, then invalidates
+      cache_fence(clk, host_req);
+
+      -- Re-read all addresses: the FSM processes the fence first (flush + clear),
+      -- then handles the buffered read request. Each read is a miss (cache was
+      -- invalidated) and fills from memory which now has the written-back data.
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        wr_data := x"D000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+        cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+        check_equal(bus_activity, '1', "post-fence: line " & INTEGER'image(i) & " should be a miss");
+        check_equal(rd_err, '0', "post-fence read error line " & INTEGER'image(i));
+        check_equal(rd_data, wr_data, "post-fence data mismatch line " & INTEGER'image(i));
+      END LOOP;
+
+      -- Verify memory has the new (written-back) data via direct inspection
+      -- (fence flush is complete by now since the reads above went through)
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        wr_data := x"D000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+        mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR(test_addr), rd_data);
+        check_equal(rd_data, wr_data, "memory should have written-back data line " & INTEGER'image(i));
+      END LOOP;
+
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- partial_dirty_flush
+    -- Fill all lines, write only even-indexed lines (odd stay clean).
+    -- Fence flushes only dirty (even) lines. Verify even-indexed
+    -- addresses have new data in memory, odd have original seed data.
+    -- ----------------------------------------------------------------
+    IF run("partial_dirty_flush") THEN
+
+      -- Seed and fill all cache lines
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        wr_data := x"A000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+        mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
+        cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+        check_equal(rd_err, '0', "fill read error line " & INTEGER'image(i));
+      END LOOP;
+
+      -- Write new data to even-indexed lines only
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        IF (i MOD 2) = 0 THEN
+          test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+          wr_data := x"D000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+          cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), wr_data, "1111", rd_err);
+          check_equal(rd_err, '0', "write error line " & INTEGER'image(i));
+        END IF;
+      END LOOP;
+
+      -- Fence -> flushes dirty (even) lines, skips clean (odd) lines
+      cache_fence(clk, host_req);
+
+      -- Read all lines (forces fence to complete, all should be misses)
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+        check_equal(bus_activity, '1', "post-fence: line " & INTEGER'image(i) & " should be a miss");
+        check_equal(rd_err, '0', "post-fence read error line " & INTEGER'image(i));
+      END LOOP;
+
+      -- Inspect memory: even lines have new data, odd lines have original
+      FOR i IN 0 TO NUM_BLOCKS - 1 LOOP
+        test_addr := to_unsigned(i * BLOCK_SIZE, 32);
+        IF (i MOD 2) = 0 THEN
+          wr_data := x"D000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+          mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR(test_addr), rd_data);
+          check_equal(rd_data, wr_data, "even line " & INTEGER'image(i) & " should have new data");
+        ELSE
+          wr_data := x"A000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+          mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR(test_addr), rd_data);
+          check_equal(rd_data, wr_data, "odd line " & INTEGER'image(i) & " should have original data");
+        END IF;
+      END LOOP;
+
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- byte_write_dirty
+    -- Fill a cache line, then do a partial byte write (ben="0100").
+    -- Only byte 2 should change in cache. Memory still has old data.
+    -- Trigger eviction -> writeback. Verify memory has merged data.
+    -- ----------------------------------------------------------------
+    IF run("byte_write_dirty") THEN
+      test_addr := x"00000000";
+
+      -- Seed memory with known word, seed eviction address
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), STD_ULOGIC_VECTOR'(x"12345678"));
+      test_addr := to_unsigned(NUM_BLOCKS * BLOCK_SIZE, 32); -- same index, different tag
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), STD_ULOGIC_VECTOR'(x"00000000"));
+
+      -- Read addr 0 -> miss, fills cache line
+      test_addr := x"00000000";
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(rd_err, '0', "fill read error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"12345678"), "fill data mismatch");
+
+      -- Partial write: only byte 2 (bits 23:16) updated
+      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), STD_ULOGIC_VECTOR'(x"FFFFFFFF"), "0100", rd_err);
+      check_equal(rd_err, '0', "partial write error");
+
+      -- Read back -> hit, should show merged data
+      wait_cycles(clk, 2);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '0', "read after partial write should be a hit");
+      check_equal(rd_err, '0', "read error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"12FF5678"), "only byte 2 should have changed");
+
+      -- Memory should still have original data (not written back)
+      mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR'(x"00000000"), rd_data);
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"12345678"), "memory should have old data before eviction");
+
+      -- Trigger eviction: read different tag at same index -> writeback dirty line
+      test_addr := to_unsigned(NUM_BLOCKS * BLOCK_SIZE, 32);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "eviction read should be a miss");
+      check_equal(rd_err, '0', "eviction read error");
+
+      -- Memory should now have the merged (written-back) data
+      mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR'(x"00000000"), rd_data);
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"12FF5678"), "memory should have merged data after writeback");
+
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- bus_error_during_writeback
+    -- Make a line dirty, enable force_err, trigger dirty eviction.
+    -- Bus errors during writeback accumulate; the subsequent fill also
+    -- errors. S_DONE returns err to host. Line is NOT validated.
+    -- ----------------------------------------------------------------
+    IF run("bus_error_during_writeback") THEN
+      test_addr := x"00000000";
+
+      -- Seed addr A and addr B
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), x"AABBCCDD");
+      test_addr := to_unsigned(NUM_BLOCKS * BLOCK_SIZE, 32);
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), x"11223344");
+
+      -- Read addr A -> fill
+      test_addr := x"00000000";
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(rd_err, '0', "fill A error");
+
+      -- Write to addr A -> dirty
+      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), x"DEADBEEF", "1111", rd_err);
+      check_equal(rd_err, '0', "write A error");
+
+      -- Enable error injection
+      force_err <= '1';
+
+      -- Read addr B -> dirty eviction of A (errors) + fill B (errors)
+      test_addr := to_unsigned(NUM_BLOCKS * BLOCK_SIZE, 32);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(rd_err, '1', "dirty eviction + fill with errors should propagate err");
+
+      -- Disable error injection
+      force_err <= '0';
+      wait_cycles(clk, 2);
+
+      -- Re-read addr B -> should be a miss (line not validated due to errors)
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(bus_activity, '1', "read after failed fill should be a miss");
+      check_equal(rd_err, '0', "retry read should succeed");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"11223344"), "retry read data mismatch");
+
+    END IF;
+
+    -- ----------------------------------------------------------------
+    -- multi_word_writeback
+    -- Fill a block with distinct per-word values. Modify only word 0.
+    -- Trigger eviction. Verify all words in memory: word 0 has new
+    -- value, others have original fill values (entire line written back).
+    -- ----------------------------------------------------------------
+    IF run("multi_word_writeback") THEN
+
+      -- Seed all words of block at index 0 with distinct values
+      FOR i IN 0 TO BLOCK_SIZE/4 - 1 LOOP
+        test_addr := to_unsigned(i * 4, 32);
+        wr_data := x"F000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+        mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), wr_data);
+      END LOOP;
+
+      -- Seed eviction address (same index, different tag)
+      test_addr := to_unsigned(NUM_BLOCKS * BLOCK_SIZE, 32);
+      mem_seed(clk, init_we, init_addr, init_data, STD_ULOGIC_VECTOR(test_addr), x"00000000");
+
+      -- Read word 0 -> miss, fills entire block
+      test_addr := x"00000000";
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(rd_err, '0', "fill read error");
+      check_equal(rd_data, STD_ULOGIC_VECTOR'(x"F0000000"), "fill word 0 mismatch");
+
+      -- Write ONLY word 0 with new value -> marks line dirty
+      cache_write(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), x"DEADBEEF", "1111", rd_err);
+      check_equal(rd_err, '0', "write error");
+
+      -- Trigger eviction -> writeback entire line, then fill new tag
+      test_addr := to_unsigned(NUM_BLOCKS * BLOCK_SIZE, 32);
+      cache_read(clk, host_req, host_rsp, STD_ULOGIC_VECTOR(test_addr), rd_data, rd_err);
+      check_equal(rd_err, '0', "eviction read error");
+
+      -- Inspect all words: word 0 has new value, others have original fill values
+      FOR i IN 0 TO BLOCK_SIZE/4 - 1 LOOP
+        test_addr := to_unsigned(i * 4, 32);
+        mem_inspect(inspect_addr, inspect_data, STD_ULOGIC_VECTOR(test_addr), rd_data);
+        IF i = 0 THEN
+          check_equal(rd_data, STD_ULOGIC_VECTOR'(x"DEADBEEF"), "word 0 should have new value");
+        ELSE
+          wr_data := x"F000" & STD_ULOGIC_VECTOR(to_unsigned(i, 16));
+          check_equal(rd_data, wr_data, "word " & INTEGER'image(i) & " should have original fill value");
+        END IF;
+      END LOOP;
+
+    END IF;
+
     test_runner_cleanup(runner);
   END PROCESS;
 
   -- VUnit watchdog: fail if test hangs --
-  test_runner_watchdog(runner, 1 ms);
+  test_runner_watchdog(runner, 5 ms);
 
 END ARCHITECTURE;

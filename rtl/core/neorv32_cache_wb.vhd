@@ -148,7 +148,7 @@ BEGIN
   END PROCESS ctrl_engine_sync;
   -- Control Engine FSM Comb ----------------------------------------------------------------
   -- -------------------------------------------------------------------------------------------
-  ctrl_engine_comb : PROCESS (ctrl, host_req_i, cache_i, bus_rsp_i, bp_rsp)
+  ctrl_engine_comb : PROCESS (all)
   BEGIN
     -- control engine defaults --
     ctrl_nxt.state <= ctrl.state;
@@ -321,12 +321,15 @@ BEGIN
 
       WHEN S_WRITEBACK_SETUP =>
         cache_o.addr <= ctrl.tag_idx & ctrl.ofs_int & "00";
+        bus_req_o.lock <= '1'; -- keep bus locked between writeback beats
+        bus_req_o.burst <= bool_to_ulogic_f(bursts_en_c); -- maintain burst signal
         ctrl_nxt.state <= S_WRITEBACK_SEND;
 
       WHEN S_WRITEBACK_SEND =>
-        bus_req_o.stb <= '1'; -- let's go 
+        bus_req_o.stb <= '1'; -- let's go
         bus_req_o.rw <= '1'; -- write
         bus_req_o.lock <= '1'; -- hold the bus for the full line
+        bus_req_o.burst <= bool_to_ulogic_f(bursts_en_c); -- burst transfer
         bus_req_o.ben <= (OTHERS => '1'); -- full word write
         bus_req_o.data <= cache_i.data;
         bus_req_o.addr <= ctrl.wb_tag & ctrl.tag_idx(index_width_c - 1 DOWNTO 0) & ctrl.ofs_int & "00";
@@ -334,13 +337,15 @@ BEGIN
 
       WHEN S_WRITEBACK_WAIT =>
         bus_req_o.lock <= '1';
+        bus_req_o.burst <= bool_to_ulogic_f(bursts_en_c); -- burst transfer
         bus_req_o.addr <= ctrl.wb_tag & ctrl.tag_idx(index_width_c - 1 DOWNTO 0) & ctrl.ofs_int & "00";
-        cache_o.addr <= ctrl.tag_idx & ctrl.ofs_int & "00"; 
+        cache_o.addr <= ctrl.tag_idx & ctrl.ofs_int & "00";
         IF (bus_rsp_i.ack = '1') THEN
           ctrl_nxt.bus_err <= ctrl.bus_err OR bus_rsp_i.err; -- accumulate errors
           IF (and_reduce_f(ctrl.ofs_int) = '1') THEN -- last word
             cache_o.cmd_dirty_clr <= '1';
             IF (ctrl.wb_flush = '0') THEN
+              ctrl_nxt.ofs_int <= (OTHERS => '0'); -- reset for download
               ctrl_nxt.state <= S_DOWNLOAD_START;
             ELSE
               ctrl_nxt.state <= S_FLUSH_SCAN;
@@ -348,6 +353,27 @@ BEGIN
           ELSE
             ctrl_nxt.ofs_int <= STD_ULOGIC_VECTOR(unsigned(ctrl.ofs_int) + 1); -- increment cacheline word offset
             ctrl_nxt.state <= S_WRITEBACK_SETUP;
+          END IF;
+        END IF;
+
+      WHEN S_FLUSH_SCAN => -- present flush index to cache ram. Results valid in next cycle (S_FLUSH_CHECK)
+        cache_o.addr <= (OTHERS => '0');
+        cache_o.addr(2 + offset_width_c + index_width_c - 1 DOWNTO 2 + offset_width_c) <= ctrl.flush_idx;
+        ctrl_nxt.state <= S_FLUSH_CHECK;
+
+      WHEN S_FLUSH_CHECK =>
+        IF (valid_rd = '1' AND dirty_rd = '1') THEN -- the current cacheline is valid and dirty -> writeback needed
+          ctrl_nxt.wb_tag <= tag_rd(tag_width_c - 1 DOWNTO 0); -- save tag
+          ctrl_nxt.tag_idx(index_width_c - 1 DOWNTO 0) <= ctrl.flush_idx;
+          ctrl_nxt.wb_flush <= '1';
+          ctrl_nxt.ofs_int <= (OTHERS => '0');
+          ctrl_nxt.state <= S_WRITEBACK_SETUP;
+        ELSE
+          IF (and_reduce_f(ctrl.flush_idx) = '1') THEN
+            ctrl_nxt.state <= S_CLEAR;
+          ELSE
+            ctrl_nxt.flush_idx <= STD_ULOGIC_VECTOR(unsigned(ctrl.flush_idx) + 1);
+            ctrl_nxt.state <= S_FLUSH_SCAN;
           END IF;
         END IF;
 
