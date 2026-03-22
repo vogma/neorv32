@@ -589,7 +589,7 @@ begin
     -- -------------------------------------------------------------------------------------------
     neorv32_dcache_enabled:
     if DCACHE_EN generate
-      neorv32_dcache_inst: entity neorv32.neorv32_cache
+      neorv32_dcache_inst: entity neorv32.neorv32_cache_wb
       generic map (
         NUM_BLOCKS => DCACHE_NUM_BLOCKS,
         BLOCK_SIZE => CACHE_BLOCK_SIZE,

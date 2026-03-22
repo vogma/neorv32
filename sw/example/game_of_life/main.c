@@ -20,7 +20,7 @@
  **************************************************************************/
 /**@{*/
 /** UART BAUD rate */
-#define BAUD_RATE   (19200)
+#define BAUD_RATE   (115200)
 /** Universe x size (has to be a multiple of 8) */
 #define NUM_CELLS_X (160)
 /** Universe y size */

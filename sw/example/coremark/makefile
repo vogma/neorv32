@@ -11,20 +11,25 @@ MARCH = rv32imc_zicsr_zifencei
 EFFORT = -O3
 
 # Add extended debug symbols
-USER_FLAGS += -ggdb -gdwarf-3
+# USER_FLAGS += -ggdb -gdwarf-3
+USER_FLAGS += -Wl,--defsym,__neorv32_rom_base=0x11000000
+USER_FLAGS += -Wl,--defsym,__neorv32_rom_size=0x02000000
+USER_FLAGS += -Wl,--defsym,__neorv32_ram_base=0x13000000
+USER_FLAGS += -Wl,--defsym,__neorv32_ram_size=0x0C000000
+USER_FLAGS += -Wl,--defsym,__neorv32_heap_size=0x01000000
 
 # Adjust processor IMEM size
-USER_FLAGS += \
--Wl,--defsym,__neorv32_rom_size=64k \
--Wl,--defsym,__neorv32_rom_base=0x00000000
+# USER_FLAGS += \
+# -Wl,--defsym,__neorv32_rom_size=64k \
+# -Wl,--defsym,__neorv32_rom_base=0x00000000
 
-# Adjust processor DMEM size
-USER_FLAGS += \
--Wl,--defsym,__neorv32_ram_size=16k \
--Wl,--defsym,__neorv32_ram_base=0x80000000
+# # Adjust processor DMEM size
+# USER_FLAGS += \
+# -Wl,--defsym,__neorv32_ram_size=16k \
+# -Wl,--defsym,__neorv32_ram_base=0x80000000
 
 # Adjust maximum heap size
-USER_FLAGS += -Wl,--defsym,__neorv32_heap_size=8k
+# USER_FLAGS += -Wl,--defsym,__neorv32_heap_size=8k
 
 # Additional sources
 APP_SRC += $(wildcard source/*.c)

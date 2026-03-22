@@ -9,7 +9,7 @@ GHDL="${GHDL:-ghdl}"
 mkdir -p build
 
 # GHDL import
-find ../rtl/core ../sim -type f -name '*.vhd'  -exec \
+find ../rtl/core ../sim -path ../sim/vunit -prune -o -path ../sim/osvvm -prune -o -type f -name '*.vhd' -print -exec \
   ghdl -i --std=08 --workdir=build --ieee=standard --work=neorv32 {} \;
 
 # GHDL analyze

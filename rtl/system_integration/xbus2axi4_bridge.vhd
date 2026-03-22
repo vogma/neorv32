@@ -83,6 +83,7 @@ architecture xbus2axi4_bridge_rtl of xbus2axi4_bridge is
   signal wr_all_sent   : std_ulogic;
   signal wr_burst_ack  : std_ulogic;
   signal wr_burst_err  : std_ulogic;
+  signal rd_beat_cnt   : unsigned(7 downto 0);
 
 begin
 
@@ -99,6 +100,7 @@ begin
       wr_burst_strb <= (others => '0');
       wr_beat_cnt   <= (others => '0');
       wr_all_sent   <= '0';
+      rd_beat_cnt   <= (others => '0');
     elsif rising_edge(clk) then
       -- AXI handshake --
       arvalid <= arvalid and std_ulogic(not m_axi_arready);
@@ -131,6 +133,8 @@ begin
               arvalid <= not xbus_we_i;
               awvalid <= xbus_we_i;
               wvalid  <= xbus_we_i;
+              wr_burst_data <= std_logic_vector(xbus_dat_i);
+              wr_burst_strb <= std_logic_vector(xbus_sel_i);
               state   <= "01";
             end if;
           end if;
@@ -143,8 +147,12 @@ begin
 
         when "10" => -- burst read transfer in progress
         -- ------------------------------------------------------------
-          if (BURST_EN = false) or (xbus_cti_i = "000") then -- burst completed by host
-            state <= (others => '0');
+          if (m_axi_rvalid = '1') then
+            rd_beat_cnt <= rd_beat_cnt + 1;
+          end if;
+          if (BURST_EN = false) or ((m_axi_rvalid = '1') and (rd_beat_cnt = unsigned(blen_c))) then
+            state       <= (others => '0');
+            rd_beat_cnt <= (others => '0');
           end if;
 
         when "11" => -- burst write transfer in progress
@@ -200,8 +208,8 @@ begin
   m_axi_awvalid <= std_logic(awvalid);
 
   -- AXI write data channel --
-  m_axi_wdata   <= wr_burst_data when (state = "11") else std_logic_vector(xbus_dat_i);
-  m_axi_wstrb   <= wr_burst_strb when (state = "11") else std_logic_vector(xbus_sel_i);
+  m_axi_wdata   <= wr_burst_data when (state = "11") or (state = "01") else std_logic_vector(xbus_dat_i);
+  m_axi_wstrb   <= wr_burst_strb when (state = "11") or (state = "01") else std_logic_vector(xbus_sel_i);
   m_axi_wlast   <= '1' when (state /= "11") or (wr_beat_cnt = unsigned(blen_c)) else '0';
   m_axi_wvalid  <= std_logic(wvalid);
 

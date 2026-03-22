@@ -27,7 +27,7 @@ Original Author: Shay Gal-on
 #include <stdlib.h>
 #include <neorv32.h>
 
-#define BAUD_RATE  (19200)
+#define BAUD_RATE  (115200)
 #define ITERATIONS (2000)
 
 /* Configuration : HAS_FLOAT
