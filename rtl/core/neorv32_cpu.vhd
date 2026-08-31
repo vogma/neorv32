@@ -43,6 +43,7 @@ entity neorv32_cpu is
     RISCV_ISA_Zcb       : boolean                        := false;       -- additional code size reduction instructions
     RISCV_ISA_Zcmop     : boolean                        := false;       -- compressed may-be-operations
     RISCV_ISA_Zcmp      : boolean                        := false;       -- additional code size reduction instructions
+    RISCV_ISA_Zcmt      : boolean                        := false;       -- table jump instructions
     RISCV_ISA_Zfinx     : boolean                        := false;       -- 32-bit floating-point extension
     RISCV_ISA_Zibi      : boolean                        := false;       -- branch with immediate
     RISCV_ISA_Zicntr    : boolean                        := false;       -- base counters
@@ -113,6 +114,7 @@ architecture neorv32_cpu_rtl of neorv32_cpu is
   constant riscv_zcb_c   : boolean := RISCV_ISA_C and RISCV_ISA_Zcb; -- Zcb: additional compressed instructions
   constant riscv_zcmop_c : boolean := RISCV_ISA_C and RISCV_ISA_Zimop and RISCV_ISA_Zcmop; -- Zcmop: compressed may-be-operations
   constant riscv_zcmp_c  : boolean := RISCV_ISA_C and RISCV_ISA_Zcmp; -- Zcmp: additional compressed instructions
+  constant riscv_zcmt_c  : boolean := RISCV_ISA_C and RISCV_ISA_Zcmt; -- Zcmt: table jump instructions
   constant riscv_zkt_c   : boolean := CPU_FAST_SHIFT_EN; -- Zkt: data-independent execution time for cryptography operations
   constant riscv_zkn_c   : boolean := RISCV_ISA_Zbkb and RISCV_ISA_Zbkc and RISCV_ISA_Zbkx and
                                       RISCV_ISA_Zkne and RISCV_ISA_Zknd and RISCV_ISA_Zknh; -- Zkn: NIST suite
@@ -143,6 +145,7 @@ architecture neorv32_cpu_rtl of neorv32_cpu is
   signal lsu_wait    : std_ulogic;                     -- wait for current data bus access
   signal csr_rdata   : std_ulogic_vector(31 downto 0); -- CSR read data
   signal irq_machine : std_ulogic_vector(2 downto 0);  -- RISC-V standard machine-level interrupts
+  signal jvt         : std_ulogic_vector(31 downto 0); -- Zcmt jump-table base address (jvt CSR)
 
   -- external CSR interface read-back --
   signal xcsr_tm, xcsr_cnt, xcsr_pmp, xcsr_alu, xcsr_res : std_ulogic_vector(31 downto 0);
@@ -176,6 +179,7 @@ begin
       sel_string_f(riscv_zcb_c,         "_zcb",       "" ) &
       sel_string_f(riscv_zcmop_c,       "_zcmop",     "" ) &
       sel_string_f(riscv_zcmp_c,        "_zcmp",      "" ) &
+      sel_string_f(riscv_zcmt_c,        "_zcmt",      "" ) &
       sel_string_f(RISCV_ISA_Zfinx,     "_zfinx",     "" ) &
       sel_string_f(RISCV_ISA_Zibi,      "_zibi",      "" ) &
       sel_string_f(RISCV_ISA_Zicntr,    "_zicntr",    "" ) &
@@ -218,6 +222,10 @@ begin
       "[NEORV32] CPU ISA: Zcb requires C!" severity error;
     assert not (RISCV_ISA_Zcmop and ((not RISCV_ISA_C) or (not RISCV_ISA_Zimop))) report
       "[NEORV32] CPU ISA: Zcmop requires C and Zimop!" severity error;
+    assert not (RISCV_ISA_Zcmp and (not RISCV_ISA_C)) report
+      "[NEORV32] CPU ISA: Zcmp requires C!" severity error;
+    assert not (RISCV_ISA_Zcmt and (not RISCV_ISA_C)) report
+      "[NEORV32] CPU ISA: Zcmt requires C!" severity error;
 
   end generate;
 
@@ -230,13 +238,15 @@ begin
     RISCV_C     => RISCV_ISA_C,   -- implement C ISA extension
     RISCV_ZCB   => RISCV_ISA_Zcb, -- implement Zcb ISA sub-extension
     RISCV_ZCMOP => riscv_zcmop_c, -- implement Zcmop ISA sub-extension
-    RISCV_ZCMP  => riscv_zcmp_c   -- implement Zcmp ISA sub-extension
+    RISCV_ZCMP  => riscv_zcmp_c,  -- implement Zcmp ISA sub-extension
+    RISCV_ZCMT  => riscv_zcmt_c   -- implement Zcmt ISA sub-extension
   )
   port map (
     -- global control --
     clk_i      => clk_i,       -- global clock, rising edge
     rstn_i     => rstn_i,      -- global reset, low-active, async
     ctrl_i     => ctrl,        -- main control bus
+    jvt_i      => jvt,         -- Zcmt jump-table base address
     -- instruction fetch interface --
     ibus_req_o => ibus_req_o,  -- request
     ibus_rsp_i => ibus_rsp_i,  -- response
@@ -278,6 +288,7 @@ begin
     RISCV_ISA_Zcb       => riscv_zcb_c,         -- additional code size reduction instructions
     RISCV_ISA_Zcmop     => riscv_zcmop_c,       -- compressed may-be-operations
     RISCV_ISA_Zcmp      => riscv_zcmp_c,        -- additional code size reduction instructions
+    RISCV_ISA_Zcmt      => riscv_zcmt_c,        -- table jump instructions
     RISCV_ISA_Zfinx     => RISCV_ISA_Zfinx,     -- 32-bit floating-point extension
     RISCV_ISA_Zibi      => RISCV_ISA_Zibi,      -- branch with immediate
     RISCV_ISA_Zicntr    => RISCV_ISA_Zicntr,    -- base counters
@@ -306,6 +317,7 @@ begin
     clk_i         => clk_i,       -- global clock, rising edge
     rstn_i        => rstn_i,      -- global reset, low-active, async
     ctrl_o        => ctrl,        -- main control bus
+    jvt_o         => jvt,         -- Zcmt jump-table base address
     -- misc --
     frontend_i    => frontend,    -- front-end status and data
     hwtrig_i      => hwtrig,      -- hardware trigger

@@ -25,13 +25,15 @@ entity neorv32_cpu_frontend is
     RISCV_C     : boolean; -- implement C ISA extension
     RISCV_ZCB   : boolean; -- implement Zcb ISA sub-extension
     RISCV_ZCMOP : boolean; -- implement Zcmop ISA sub-extension
-    RISCV_ZCMP  : boolean  -- implement Zcmp ISA sub-extension
+    RISCV_ZCMP  : boolean; -- implement Zcmp ISA sub-extension
+    RISCV_ZCMT  : boolean  -- implement Zcmt ISA sub-extension
   );
   port (
     -- global control --
     clk_i      : in  std_ulogic; -- global clock, rising edge
     rstn_i     : in  std_ulogic; -- global reset, low-active, async
     ctrl_i     : in  ctrl_bus_t; -- main control bus
+    jvt_i      : in  std_ulogic_vector(31 downto 0); -- Zcmt jump-table base address (jvt CSR)
     -- instruction fetch interface --
     ibus_req_o : out bus_req_t; -- request
     ibus_rsp_i : in  bus_rsp_t; -- response
@@ -64,7 +66,7 @@ architecture neorv32_cpu_frontend_rtl of neorv32_cpu_frontend is
   end component;
 
   -- instruction fetch engine --
-  type state_t is (S_RESTART, S_REQUEST, S_PENDING);
+  type state_t is (S_RESTART, S_REQUEST, S_PENDING, S_ZCMT_REQ, S_ZCMT_PENDING);
   type fetch_t is record
     state : state_t;
     reset : std_ulogic; -- buffered restart request (after branch)
@@ -100,6 +102,21 @@ architecture neorv32_cpu_frontend_rtl of neorv32_cpu_frontend is
   signal instr_is_zcmp : std_ulogic; -- decompressor: instruction is a Zcmp instruction
   signal zcmp_op : zcmp_op_t; -- decompressor: Zcmp operation type
 
+  -- Zcmt table-jump issue engine --
+  signal instr_is_zcmt : std_ulogic; -- decompressor: instruction is a Zcmt instruction (cm.jt/cm.jalt)
+  signal zcmt_detect : std_ulogic; -- zcmt instruction detected, table-jump sequence starts next cycle
+  signal zcmt_in_uop_seq : std_ulogic; -- table-jump sequence running
+  signal frontend_bus_zcmt : if_bus_t; -- front-end bus source: Zcmt sequencer
+  signal zcmt_target_reg : std_ulogic_vector(31 downto 0); -- table entry registered in the Zcmt sequencer
+  signal uop_busy : std_ulogic; -- any micro-op sequencer (Zcmp or Zcmt) running
+
+  -- Zcmt jump-table read interface (fetch engine <-> Zcmt sequencer) --
+  signal zcmt_req      : std_ulogic; -- level: jump-table read requested
+  signal zcmt_req_addr : std_ulogic_vector(31 downto 0); -- jump-table entry address
+  signal zcmt_rsp_ack  : std_ulogic; -- one-shot: jump-table read response valid
+  signal zcmt_rsp_data : std_ulogic_vector(31 downto 0); -- jump-table entry data
+  signal zcmt_rsp_err  : std_ulogic; -- jump-table read bus/PMP error
+
 begin
 
   -- ******************************************************************************************************************
@@ -130,7 +147,9 @@ begin
         when S_REQUEST => -- request next 32-bit-aligned instruction word
         -- ------------------------------------------------------------
           fetch.reset <= restart; -- buffer restart request
-          if (ipb_free = "11") then -- free IPB space?
+          if (zcmt_req = '1') and (restart = '0') then -- divert: Zcmt jump-table read (must not depend on IPB space - IPB can be full while the issue engine is parked)
+            fetch.state <= S_ZCMT_REQ;
+          elsif (ipb_free = "11") then -- free IPB space?
             fetch.state <= S_PENDING;
           elsif (restart = '1') then -- restart request due to branch
             fetch.state <= S_RESTART;
@@ -148,6 +167,26 @@ begin
             end if;
           end if;
 
+        when S_ZCMT_REQ => -- Zcmt: issue jump-table read request (stb fires in this cycle unless restarting)
+        -- ------------------------------------------------------------
+          fetch.reset <= restart; -- buffer restart request
+          if (restart = '1') then -- restart request due to branch/trap
+            fetch.state <= S_RESTART;
+          else
+            fetch.state <= S_ZCMT_PENDING;
+          end if;
+
+        when S_ZCMT_PENDING => -- Zcmt: wait for jump-table read response (never touch fetch.addr here - preserved for resume)
+        -- ------------------------------------------------------------
+          fetch.reset <= restart; -- buffer restart request
+          if (ibus_rsp_i.ack = '1') then -- wait for bus response
+            if (restart = '1') then -- restart request due to branch/trap
+              fetch.state <= S_RESTART;
+            else -- resume linear prefetch
+              fetch.state <= S_REQUEST;
+            end if;
+          end if;
+
       end case;
     end if;
   end process;
@@ -155,14 +194,20 @@ begin
   -- reset instruction fetch after branch --
   restart <= fetch.reset or ctrl_i.if_reset;
 
-  -- PMP interface --
-  pmp_addr_o <= fetch.addr(31 downto 2) & "00"; -- word aligned
+  -- PMP interface (Zcmt jump-table reads use the table-entry address; the mux switches in the
+  -- stb cycle and holds through ack because the PMP fault output is registered) --
+  pmp_addr_o <= zcmt_req_addr(31 downto 2) & "00" when (fetch.state = S_ZCMT_REQ) or (fetch.state = S_ZCMT_PENDING) else
+                fetch.addr(31 downto 2) & "00"; -- word aligned
   pmp_priv_o <= fetch.priv;
 
   -- instruction bus request --
   ibus_req_o.meta  <= hid_c & fetch.debug & fetch.priv & '1';
-  ibus_req_o.addr  <= fetch.addr(31 downto 2) & "00"; -- word aligned
-  ibus_req_o.stb   <= '1' when (fetch.state = S_REQUEST) and (ipb_free = "11") else '0';
+  ibus_req_o.addr  <= zcmt_req_addr(31 downto 2) & "00" when (fetch.state = S_ZCMT_REQ) or (fetch.state = S_ZCMT_PENDING) else
+                      fetch.addr(31 downto 2) & "00"; -- word aligned
+  -- only a single outstanding transaction: the normal prefetch stb is gated with the exact
+  -- S_ZCMT_REQ divert condition so prefetch and table read can never overlap --
+  ibus_req_o.stb   <= '1' when ((fetch.state = S_REQUEST) and (ipb_free = "11") and ((zcmt_req = '0') or (restart = '1'))) or
+                               ((fetch.state = S_ZCMT_REQ) and (restart = '0')) else '0';
   ibus_req_o.data  <= (others => '0'); -- read-only
   ibus_req_o.ben   <= (others => '1'); -- always full-word access
   ibus_req_o.rw    <= '0'; -- read-only
@@ -170,6 +215,12 @@ begin
   ibus_req_o.amoop <= (others => '0'); -- cannot be an atomic memory operation
   ibus_req_o.burst <= '0'; -- only single-access
   ibus_req_o.lock  <= '0'; -- always unlocked access
+
+  -- Zcmt jump-table read response (to Zcmt sequencer; IPB writes are S_PENDING-only so table
+  -- reads can never pollute the prefetch buffer) --
+  zcmt_rsp_ack  <= '1' when (fetch.state = S_ZCMT_PENDING) and (ibus_rsp_i.ack = '1') else '0';
+  zcmt_rsp_data <= ibus_rsp_i.data;
+  zcmt_rsp_err  <= ibus_rsp_i.err or pmp_err_i;
 
   -- IPB instruction data and status --
   ipb_wdata(0) <= (ibus_rsp_i.err or pmp_err_i) & ibus_rsp_i.data(15 downto 0);
@@ -212,13 +263,15 @@ begin
     generic map (
       ZCB_EN   => RISCV_ZCB,
       ZCMOP_EN => RISCV_ZCMOP,
-      ZCMP_EN  => RISCV_ZCMP
+      ZCMP_EN  => RISCV_ZCMP,
+      ZCMT_EN  => RISCV_ZCMT
     )
     port map (
       instr_i       => cmd16,
       instr_o       => cmd32,
       instr_is_zcmp => instr_is_zcmp,
-      zcmp_op       => zcmp_op
+      zcmp_op       => zcmp_op,
+      instr_is_zcmt => instr_is_zcmt
     );
 
     -- half-word select --
@@ -243,7 +296,7 @@ begin
       end if;
     end process;
 
-    issue_fsm_comb: process(align_q, fetch, ipb_avail, ipb_rdata, cmd32, zcmp_instr_reg, instr_is_zcmp, issue_state_reg, zcmp_in_uop_seq)
+    issue_fsm_comb: process(align_q, fetch, ipb_avail, ipb_rdata, cmd32, zcmp_instr_reg, instr_is_zcmp, instr_is_zcmt, issue_state_reg, uop_busy)
     begin
       -- defaults --
       align_set <= '0';
@@ -253,6 +306,7 @@ begin
       issue_valid_zcmp <= "00";
       zcmp_instr_nxt <= zcmp_instr_reg;
       zcmp_detect <= '0';
+      zcmt_detect <= '0';
       frontend_bus_issue.i32   <= (others => '0');
       frontend_bus_issue.compr <= '0';
       frontend_bus_issue.fault <= '0';
@@ -270,6 +324,10 @@ begin
                 zcmp_instr_nxt  <= ipb_rdata(0)(15 downto 0); -- save Zcmp instruction
                 issue_state_nxt <= S_ZCMP;
                 zcmp_detect     <= '1'; -- Zcmp micro-op sequence is about to start
+              elsif (instr_is_zcmt = '1') and (ipb_rdata(0)(16) = '0') then -- Zcmt instruction without fetch fault
+                zcmp_instr_nxt  <= ipb_rdata(0)(15 downto 0); -- save Zcmt instruction (shared latch)
+                issue_state_nxt <= S_ZCMP; -- shared micro-op wait state
+                zcmt_detect     <= '1'; -- Zcmt table-jump sequence is about to start
               else
                 align_set <= ipb_avail(0); -- start of next instruction word is NOT 32-bit-aligned
                 issue_valid <= '0' & ipb_avail(0);
@@ -290,6 +348,10 @@ begin
                 zcmp_instr_nxt  <= ipb_rdata(1)(15 downto 0); -- save Zcmp instruction
                 issue_state_nxt <= S_ZCMP;
                 zcmp_detect     <= '1'; -- Zcmp micro-op sequence is about to start
+              elsif (instr_is_zcmt = '1') and (ipb_rdata(1)(16) = '0') then -- Zcmt instruction without fetch fault
+                zcmp_instr_nxt  <= ipb_rdata(1)(15 downto 0); -- save Zcmt instruction (shared latch)
+                issue_state_nxt <= S_ZCMP; -- shared micro-op wait state
+                zcmt_detect     <= '1'; -- Zcmt table-jump sequence is about to start
               else
                 align_clr <= ipb_avail(1); -- start of next instruction word IS 32-bit-aligned again
                 issue_valid <= ipb_avail(1) & '0';
@@ -305,9 +367,9 @@ begin
             end if;
           end if;
 
-        when S_ZCMP => -- Zcmp micro-op sequence in progress; the sequencer drives the front-end bus
+        when S_ZCMP => -- Zcmp/Zcmt micro-op sequence in progress; the sequencer drives the front-end bus
         -- ------------------------------------------------------------
-          if (zcmp_in_uop_seq = '0') then -- sequence has completed
+          if (uop_busy = '0') then -- sequence has completed
             issue_state_nxt <= S_ISSUE;
             zcmp_instr_nxt  <= (others => '0');
             if (align_q = '0') then
@@ -328,10 +390,30 @@ begin
 
     -- issue valid instruction word to execution stage --
     frontend_bus_issue.valid <= issue_valid(1) or issue_valid(0);
-    frontend_bus_issue.zcmp_start <= zcmp_detect; -- Zcmp micro-op sequence is about to start
+    frontend_bus_issue.zcmp_start <= zcmp_detect or zcmt_detect; -- micro-op sequence is about to start (arms the PC-hold)
+    frontend_bus_issue.zcmt_branch <= '0';
+    frontend_bus_issue.zcmt_target <= (others => '0');
 
-    -- bus switch: while a Zcmp micro-op sequence is being issued the sequencer drives the front-end bus --
-    frontend_o <= frontend_bus_zcmp when (zcmp_in_uop_seq = '1') else frontend_bus_issue;
+    -- any micro-op sequencer running? --
+    uop_busy <= zcmp_in_uop_seq or zcmt_in_uop_seq;
+
+    -- bus switch: while a micro-op sequence is being issued the corresponding sequencer drives the
+    -- front-end bus. The Zcmt branch target is NOT muxed but taken straight from the sequencer's
+    -- table-entry register: the control unit consumes it in S_BRANCH, two cycles after the jalr
+    -- micro-op's dispatch, when the mux has already switched back to the issue engine (see the
+    -- stability note in neorv32_cpu_zcmt) --
+    frontend_switch: process(frontend_bus_zcmp, frontend_bus_zcmt, frontend_bus_issue,
+                             zcmp_in_uop_seq, zcmt_in_uop_seq, zcmt_target_reg)
+    begin
+      if (zcmp_in_uop_seq = '1') then
+        frontend_o <= frontend_bus_zcmp;
+      elsif (zcmt_in_uop_seq = '1') then
+        frontend_o <= frontend_bus_zcmt;
+      else
+        frontend_o <= frontend_bus_issue;
+      end if;
+      frontend_o.zcmt_target <= zcmt_target_reg; -- field override; registered in the Zcmt sequencer
+    end process frontend_switch;
 
     -- IPB read access --
     ipb_re(0) <= (issue_valid(0) and ctrl_i.if_ready) or issue_valid_zcmp(0);
@@ -361,6 +443,39 @@ begin
       zcmp_in_uop_seq <= '0';
     end generate;
 
+    -- Zcmt Table-Jump Sequencer --------------------------------------------------------------
+    -- -------------------------------------------------------------------------------------------
+    zcmt_enabled:
+    if RISCV_ZCMT generate
+      neorv32_cpu_zcmt_inst: entity neorv32.neorv32_cpu_zcmt
+      port map (
+        clk_i             => clk_i,
+        rstn_i            => rstn_i,
+        ctrl_i            => ctrl_i,
+        zcmt_detect       => zcmt_detect,
+        fetch_restart     => fetch.reset,
+        ipb_avail         => ipb_avail,
+        zcmt_instr_reg    => zcmp_instr_reg, -- shared latch
+        jvt_i             => jvt_i,
+        tbl_req_o         => zcmt_req,
+        tbl_addr_o        => zcmt_req_addr,
+        tbl_ack_i         => zcmt_rsp_ack,
+        tbl_data_i        => zcmt_rsp_data,
+        tbl_err_i         => zcmt_rsp_err,
+        frontend_bus_zcmt => frontend_bus_zcmt,
+        zcmt_in_uop_seq   => zcmt_in_uop_seq,
+        zcmt_target_o     => zcmt_target_reg
+      );
+    end generate;
+
+    zcmt_disabled:
+    if not RISCV_ZCMT generate
+      zcmt_in_uop_seq <= '0';
+      zcmt_req        <= '0';
+      zcmt_req_addr   <= (others => '0');
+      zcmt_target_reg <= (others => '0');
+    end generate;
+
   end generate; -- /issue_enabled
 
   -- issue engine disabled --
@@ -381,6 +496,10 @@ begin
     frontend_o.zcmp_in_uop_seq  <= '0';
     frontend_o.zcmp_start       <= '0';
     frontend_o.zcmp_atomic_tail <= '0';
+    frontend_o.zcmt_branch      <= '0';
+    frontend_o.zcmt_target      <= (others => '0');
+    zcmt_req      <= '0';
+    zcmt_req_addr <= (others => '0');
   end generate;
 
 end architecture;

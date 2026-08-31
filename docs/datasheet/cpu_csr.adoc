@@ -25,6 +25,8 @@ to check if the targeted bits can actually be modified.
 | 0x001 | <<_fflags>> | `CSR_FFLAGS` | URW | Floating-point accrued exceptions
 | 0x002 | <<_frm>>    | `CSR_FRM`    | URW | Floating-point dynamic rounding mode
 | 0x003 | <<_fcsr>>   | `CSR_FCSR`   | URW | Floating-point control and status
+5+^| **<<_table_jump_csrs>>**
+| 0x017 | <<_jvt>>    | `CSR_JVT`    | URW | Table jump base address
 5+^| **<<_machine_trap_setup_csrs>>**
 | 0x300 | <<_mstatus>>    | `CSR_MSTATUS`    | MRW | Machine status register - low word
 | 0x301 | <<_misa>>       | `CSR_MISA`       | MRW | Machine CPU ISA and extensions
@@ -168,6 +170,38 @@ to check if the targeted bits can actually be modified.
 <<<
 // ####################################################################################################################
 :sectnums:
+==== Table Jump CSRs
+
+These CSRs are available if the RISC-V <<_zcmt_isa_extension,`Zcmt`>> ISA extension is enabled via the
+top's `RISCV_ISA_Zcmt` generic. Any access when the extension is disabled raises an illegal instruction
+exception.
+
+[discrete]
+===== **`jvt`**
+
+[cols="<1,<8"]
+[grid="none"]
+|=======================
+| Name        | Table jump base address
+| Address     | `0x017`
+| Reset value | `0x00000000`
+| ISA         | <<_zicsr_isa_extension,`Zicsr`>> & <<_zcmt_isa_extension,`Zcmt`>>
+| Description | Base address of the 256-entry `cm.jt`/`cm.jalt` jump table. The table must be 64-byte
+aligned: bits 5:0 (the `mode` field) are hardwired to zero (WARL). The CSR is accessible from user mode.
+|=======================
+
+.`jvt` CSR bits
+[cols="^1,^1,<10"]
+[options="header",grid="rows"]
+|=======================
+| Bit | R/W | Function
+| 31:6 | r/w | `base` - jump table base address (64-byte aligned)
+| 5:0  | r/- | `mode` - hardwired to zero
+|=======================
+
+
+<<<
+// ####################################################################################################################
 ==== Machine Trap Setup CSRs
 
 [discrete]
@@ -990,7 +1024,9 @@ discover additional ISA (sub-)extensions (beyond the _base_ extensions listed in
 [options="header",grid="rows"]
 |=======================
 | Bit | Name [C] | R/W | Description
-| 31:2 | -                  | r/- | _reserved_, read as zero
+| 31:4 | -                  | r/- | _reserved_, read as zero
+|    3 | `CSR_MXISAH_ZCMT`  | r/- | <<_zcmt_isa_extension>> available
+|    2 | `CSR_MXISAH_ZCMP`  | r/- | <<_zcmp_isa_extension>> available
 |    1 | `CSR_MXISAH_ZCMOP` | r/- | <<_zcmop_isa_extension>> available
 |    0 | `CSR_MXISAH_ZBC`   | r/- | <<_zbc_isa_extension>> available
 |=======================

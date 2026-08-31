@@ -44,6 +44,7 @@ entity neorv32_tb is
     RISCV_ISA_Zcb     : boolean                        := true;        -- additional code size reduction instructions
     RISCV_ISA_Zcmop   : boolean                        := true;        -- compressed may-be-operations
     RISCV_ISA_Zcmp    : boolean                        := true;        -- additional code size reduction instructions
+    RISCV_ISA_Zcmt    : boolean                        := true;        -- table jump instructions
     RISCV_ISA_Zfinx   : boolean                        := true;        -- 32-bit floating-point extension
     RISCV_ISA_Zibi    : boolean                        := true;        -- branch with immediate
     RISCV_ISA_Zicntr  : boolean                        := true;        -- base counters
@@ -284,6 +285,7 @@ begin
     RISCV_ISA_Zcb       => RISCV_ISA_Zcb,
     RISCV_ISA_Zcmop     => RISCV_ISA_Zcmop,
     RISCV_ISA_Zcmp      => RISCV_ISA_Zcmp,
+    RISCV_ISA_Zcmt      => RISCV_ISA_Zcmt,
     RISCV_ISA_Zfinx     => RISCV_ISA_Zfinx,
     RISCV_ISA_Zibi      => RISCV_ISA_Zibi,
     RISCV_ISA_Zicntr    => RISCV_ISA_Zicntr,
@@ -599,7 +601,7 @@ begin
     generic map(
       NAME => "tb.uart0_rx",
       FCLK => real(CLOCK_FREQUENCY),
-      BAUD => real(19200)
+      BAUD => real(1000000)
     )
     port map(
       clk => clk_gen,
@@ -610,7 +612,7 @@ begin
     generic map(
       NAME => "tb.uart1_rx",
       FCLK => real(CLOCK_FREQUENCY),
-      BAUD => real(19200)
+      BAUD => real(1000000)
     )
     port map(
       clk => clk_gen,

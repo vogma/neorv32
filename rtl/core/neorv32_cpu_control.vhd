@@ -42,6 +42,7 @@ entity neorv32_cpu_control is
     RISCV_ISA_Zcb       : boolean; -- additional code size reduction instructions
     RISCV_ISA_Zcmop     : boolean; -- compressed may-be-operations
     RISCV_ISA_Zcmp      : boolean; -- additional code size reduction instructions
+    RISCV_ISA_Zcmt      : boolean; -- table jump instructions
     RISCV_ISA_Zfinx     : boolean; -- 32-bit floating-point extension
     RISCV_ISA_Zibi      : boolean; -- branch with immediate
     RISCV_ISA_Zicntr    : boolean; -- base counters
@@ -70,6 +71,7 @@ entity neorv32_cpu_control is
     clk_i         : in  std_ulogic;                     -- global clock, rising edge
     rstn_i        : in  std_ulogic;                     -- global reset, low-active, async
     ctrl_o        : out ctrl_bus_t;                     -- main control bus
+    jvt_o         : out std_ulogic_vector(31 downto 0); -- Zcmt jump-table base address (jvt CSR)
     -- misc --
     frontend_i    : in  if_bus_t;                       -- front-end status and data
     hwtrig_i      : in  std_ulogic;                     -- hardware trigger
@@ -142,6 +144,7 @@ architecture neorv32_cpu_control_rtl of neorv32_cpu_control is
     mtval        : std_ulogic_vector(31 downto 0); -- machine bad address or instruction
     mscratch     : std_ulogic_vector(31 downto 0); -- machine scratch register
     mcounteren   : std_ulogic_vector(31 downto 0); -- machine counter access enable
+    jvt          : std_ulogic_vector(31 downto 6); -- Zcmt jump-table base address (bits 5:0 hardwired zero)
     dcsr_ebreakm : std_ulogic; -- behavior of ebreak instruction in m-mode
     dcsr_ebreaku : std_ulogic; -- behavior of ebreak instruction in u-mode
     dcsr_step    : std_ulogic; -- single-step mode
@@ -176,6 +179,10 @@ architecture neorv32_cpu_control_rtl of neorv32_cpu_control is
   signal zcmp_trap_gate    : std_ulogic;                     -- '1' = suppress traps
   signal zcmp_ir_count_en  : std_ulogic;                     -- '1' = count as retired
   signal zcmp_dispatch_ack : std_ulogic;                     -- valid instruction dispatched
+
+  -- Zcmt branch-redirect interface (driven by generate blocks below) --
+  signal zcmt_branch_gate : std_ulogic;                     -- '1' = current instruction is a Zcmt jalr micro-op
+  signal zcmt_branch_pc   : std_ulogic_vector(31 downto 0); -- fetched jump-table entry (S_BRANCH target override)
 
 begin
 
@@ -222,7 +229,7 @@ begin
   -- -------------------------------------------------------------------------------------------
   exec_comb: process(exec, env_pend, exc_fire, ecause, exc_buf, irq_buf, debug_ctrl, hwtrig_i,
                      frontend_i, csr, ctrl, alu_cp_done_i, lsu_wait_i, alu_add_i, branch_taken,
-                     zcmp_dispatch_pc, zcmp_execute_pc2, zcmp_trap_gate)
+                     zcmp_dispatch_pc, zcmp_execute_pc2, zcmp_trap_gate, zcmt_branch_gate, zcmt_branch_pc)
     variable opcode_v : std_ulogic_vector(6 downto 0);
     variable funct7_v : std_ulogic_vector(6 downto 0);
     variable funct3_v : std_ulogic_vector(2 downto 0);
@@ -441,8 +448,12 @@ begin
           ctrl_nxt.if_reset <= '1'; -- reset instruction fetch to restart at next-PC (pc2)
         end if;
         if (branch_taken = '1') then -- taken/unconditional branch
-          instr_ma     <= alu_add_i(1) and bool_to_ulogic_f(not RISCV_ISA_C); -- branch destination misaligned?
-          exec_nxt.pc2 <= alu_add_i(31 downto 1) & '0';
+          instr_ma <= alu_add_i(1) and bool_to_ulogic_f(not RISCV_ISA_C); -- branch destination misaligned?
+          if (zcmt_branch_gate = '1') then -- Zcmt jalr micro-op: target is the fetched jump-table entry (bit 0 cleared per spec)
+            exec_nxt.pc2 <= zcmt_branch_pc(31 downto 1) & '0';
+          else
+            exec_nxt.pc2 <= alu_add_i(31 downto 1) & '0';
+          end if;
         end if;
         if (exec.ir(instr_opcode_lsb_c+2) = '1') then -- is link operation
           ctrl_nxt.pc_ret   <= exec.pc2(31 downto 1) & '0'; -- output return address
@@ -583,11 +594,12 @@ begin
   -- Zcmp PC-Hold
   -- ****************************************************************************************************************************
 
-  zcmp_pchold_enabled:
-  if RISCV_ISA_Zcmp generate
+  zcmp_pchold_enabled: -- shared by the Zcmp and the Zcmt sequencer (both drive the shared zcmp_* frontend fields)
+  if RISCV_ISA_Zcmp or RISCV_ISA_Zcmt generate
     -- internal state, invisible to FSM --
     signal zcmp_event_r : std_ulogic;
     signal zcmp_pc_r    : std_ulogic_vector(31 downto 0);
+    signal zcmp_count_r : std_ulogic;
   begin
 
     -- clocked process: capture zcmp_start as event flag; capture PC on dispatch ack --
@@ -596,6 +608,7 @@ begin
       if (rstn_i = '0') then
         zcmp_event_r <= '0';
         zcmp_pc_r    <= (others => '0');
+        zcmp_count_r <= '1';
       elsif rising_edge(clk_i) then
         -- event flag: set on zcmp_start, clear on first dispatch ack --
         if (frontend_i.zcmp_start = '1') then
@@ -606,6 +619,13 @@ begin
         -- PC capture: latch pc2 on the first dispatch after zcmp_start --
         if (zcmp_event_r = '1') and (zcmp_dispatch_ack = '1') then
           zcmp_pc_r <= exec.pc2(31 downto 1) & '0';
+        end if;
+        -- retire-count qualifier: registered at dispatch so it describes the dispatched
+        -- instruction itself (frontend state at retire time can already belong to the NEXT
+        -- instruction's sequence) - '1' for normal instructions and for the first micro-op
+        -- of a sequence, '0' for all later micro-ops --
+        if (zcmp_dispatch_ack = '1') then
+          zcmp_count_r <= (not frontend_i.zcmp_in_uop_seq) or zcmp_event_r;
         end if;
       end if;
     end process zcmp_pchold_sync;
@@ -621,19 +641,57 @@ begin
     -- trap gate: suppress traps during atomic tail of zcmp sequence --
     zcmp_trap_gate <= frontend_i.zcmp_atomic_tail;
 
-    -- retired instruction count: count only non-uop instructions, or the first uop (start) --
-    zcmp_ir_count_en <= '1' when (frontend_i.zcmp_in_uop_seq = '0') or (frontend_i.zcmp_start = '1')
-                        else '0';
+    -- retired instruction count: count only non-uop instructions and the first uop of a sequence --
+    zcmp_ir_count_en <= zcmp_count_r;
 
   end generate zcmp_pchold_enabled;
 
   zcmp_pchold_disabled:
-  if not RISCV_ISA_Zcmp generate
+  if not (RISCV_ISA_Zcmp or RISCV_ISA_Zcmt) generate
     zcmp_dispatch_pc <= exec.pc2(31 downto 1) & '0';
     zcmp_execute_pc2 <= alu_add_i(31 downto 1) & '0';
     zcmp_trap_gate   <= '0';
     zcmp_ir_count_en <= '1';
   end generate zcmp_pchold_disabled;
+
+  -- ****************************************************************************************************************************
+  -- Zcmt Branch Redirect
+  -- ****************************************************************************************************************************
+
+  zcmt_redirect_enabled:
+  if RISCV_ISA_Zcmt generate
+    -- internal state, invisible to FSM --
+    signal zcmt_branch_r : std_ulogic;
+  begin
+
+    -- set by the dispatch of the Zcmt jalr micro-op, cleared by the dispatch of any other
+    -- instruction (a trap taken instead of a dispatch leaves it unchanged, which is safe:
+    -- every instruction that can reach S_BRANCH has updated it at its own dispatch) --
+    zcmt_redirect_sync: process(rstn_i, clk_i)
+    begin
+      if (rstn_i = '0') then
+        zcmt_branch_r <= '0';
+      elsif rising_edge(clk_i) then
+        if (zcmp_dispatch_ack = '1') then
+          zcmt_branch_r <= frontend_i.zcmt_branch;
+        end if;
+      end if;
+    end process zcmt_redirect_sync;
+
+    zcmt_branch_gate <= zcmt_branch_r;
+
+    -- branch target: the table-entry register inside the Zcmt sequencer, routed past the
+    -- front-end bus mux; guaranteed stable until S_BRANCH consumes it (see the stability
+    -- note in neorv32_cpu_zcmt), so no second copy is registered here --
+    zcmt_branch_pc <= frontend_i.zcmt_target;
+
+  end generate zcmt_redirect_enabled;
+
+  zcmt_redirect_disabled:
+  if not RISCV_ISA_Zcmt generate
+    zcmt_branch_gate <= '0';
+    zcmt_branch_pc   <= (others => '0');
+  end generate zcmt_redirect_disabled;
 
   -- CSR Access Check -----------------------------------------------------------------------
   -- -------------------------------------------------------------------------------------------
@@ -647,6 +705,10 @@ begin
       -- floating-point-unit CSRs --
       when csr_fflags_c | csr_frm_c | csr_fcsr_c =>
         csr_valid(2) <= bool_to_ulogic_f(RISCV_ISA_Zfinx);
+
+      -- Zcmt jump-table CSR --
+      when csr_jvt_c =>
+        csr_valid(2) <= bool_to_ulogic_f(RISCV_ISA_Zcmt);
 
       -- machine trap setup/handling, environment/information registers, etc. --
       when csr_mstatus_c       | csr_mstatush_c  | csr_misa_c    | csr_mie_c    | csr_mtvec_c | csr_mhartid_c    |
@@ -1093,6 +1155,7 @@ begin
       csr.mtval        <= (others => '0');
       csr.mscratch     <= (others => '0');
       csr.mcounteren   <= (others => '0');
+      csr.jvt          <= (others => '0');
       csr.dcsr_ebreakm <= '0';
       csr.dcsr_ebreaku <= '0';
       csr.dcsr_step    <= '0';
@@ -1133,6 +1196,9 @@ begin
 
           when csr_mscratch_c => -- machine scratch
             csr.mscratch <= csr_wdata;
+
+          when csr_jvt_c => -- Zcmt jump-table base address (WARL: bits 5:0 hardwired zero)
+            csr.jvt <= csr_wdata(31 downto 6);
 
           when csr_mepc_c => -- machine exception program counter
             csr.mepc <= csr_wdata(31 downto 1) & '0';
@@ -1253,6 +1319,10 @@ begin
         csr.mepc(1) <= '0'; -- xPC[1] is masked when IALIGN == 32
         csr.dpc(1)  <= '0';
       end if;
+      -- no table jump instructions --
+      if not RISCV_ISA_Zcmt then
+        csr.jvt <= (others => '0');
+      end if;
 
     end if;
   end process;
@@ -1301,6 +1371,14 @@ begin
           when csr_mcounteren_c => -- machine counter enable register
             if RISCV_ISA_U and (RISCV_ISA_Zicntr or RISCV_ISA_Zihpm) then
               csr_rdata <= csr.mcounteren;
+            end if;
+
+          -- --------------------------------------------------------------------
+          -- Zcmt jump-table
+          -- --------------------------------------------------------------------
+          when csr_jvt_c => -- jump-table base address (mode bits 5:0 hardwired zero)
+            if RISCV_ISA_Zcmt then
+              csr_rdata <= csr.jvt & "000000";
             end if;
 
           -- --------------------------------------------------------------------
@@ -1380,6 +1458,8 @@ begin
           when csr_mxisah_c => -- machine extended ISA extensions information, high-word
             csr_rdata(0) <= bool_to_ulogic_f(RISCV_ISA_Zbc);   -- Zbc: carry-less multiplication
             csr_rdata(1) <= bool_to_ulogic_f(RISCV_ISA_Zcmop); -- Zcmop: compressed may-be-operations
+            csr_rdata(2) <= bool_to_ulogic_f(RISCV_ISA_Zcmp);  -- Zcmp: compressed push/pop instructions
+            csr_rdata(3) <= bool_to_ulogic_f(RISCV_ISA_Zcmt);  -- Zcmt: table jump instructions
 
           -- --------------------------------------------------------------------
           -- undefined/unavailable or implemented externally
@@ -1394,5 +1474,8 @@ begin
 
   -- CSR read data output (to register file mux) --
   csr_rdata_o <= csr_rdata;
+
+  -- Zcmt jump-table base address (to frontend) --
+  jvt_o <= csr.jvt & "000000";
 
 end architecture;

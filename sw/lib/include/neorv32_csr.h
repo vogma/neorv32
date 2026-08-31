@@ -26,6 +26,9 @@ enum NEORV32_CSR_enum {
   CSR_FRM            = 0x002, /**< 0x002 - frm:    Floating-point dynamic rounding mode */
   CSR_FCSR           = 0x003, /**< 0x003 - fcsr:   Floating-point control/status register (frm + fflags) */
 
+  /* table jump (Zcmt) */
+  CSR_JVT            = 0x017, /**< 0x017 - jvt:    Jump-vector table base address */
+
   /* machine control and status */
   CSR_MSTATUS        = 0x300, /**< 0x300 - mstatus:    Machine status register */
   CSR_MISA           = 0x301, /**< 0x301 - misa:       Machine ISA and extensions */
@@ -469,7 +472,9 @@ enum NEORV32_CSR_MXISA_enum {
 
 enum NEORV32_CSR_MXISAH_enum {
   CSR_MXISAH_ZBC   = 0, /**< mxisah CSR (0): carry-less multiplication (r/-)*/
-  CSR_MXISAH_ZCMOP = 1  /**< mxisah CSR (1): compressed may-be-operations (r/-)*/
+  CSR_MXISAH_ZCMOP = 1, /**< mxisah CSR (1): compressed may-be-operations (r/-)*/
+  CSR_MXISAH_ZCMP  = 2, /**< mxisah CSR (2): compressed push/pop instructions (r/-)*/
+  CSR_MXISAH_ZCMT  = 3  /**< mxisah CSR (3): table jump instructions (r/-)*/
 };
 
 /**********************************************************************//**

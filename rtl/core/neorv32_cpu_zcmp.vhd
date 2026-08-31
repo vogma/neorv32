@@ -165,6 +165,8 @@ begin
     frontend_bus_zcmp.zcmp_in_uop_seq <= zcmp_in_uop_seq_int;
     frontend_bus_zcmp.zcmp_atomic_tail <= '0';
     frontend_bus_zcmp.zcmp_start <= '0';
+    frontend_bus_zcmp.zcmt_branch <= '0';
+    frontend_bus_zcmp.zcmt_target <= (others => '0');
 
     case uop_state_reg is
       when S_IDLE =>

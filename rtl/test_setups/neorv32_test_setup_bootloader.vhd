@@ -47,11 +47,14 @@ begin
     -- Clocking --
     CLOCK_FREQUENCY  => CLOCK_FREQUENCY,   -- clock frequency of clk_i in Hz
     -- Boot Configuration --
-    BOOT_MODE_SELECT => 0,                 -- boot via internal bootloader
+    BOOT_MODE_SELECT => 1,                 -- boot via internal bootloader
     -- RISC-V CPU Extensions --
-    RISCV_ISA_C      => true,              -- implement compressed extension?
-    RISCV_ISA_M      => true,              -- implement mul/div extension?
-    RISCV_ISA_Zicntr => true,              -- implement base counters?
+    RISCV_ISA_C      => false,              -- implement compressed extension?
+    RISCV_ISA_zcmp   => false,              -- implement compressed extension?
+    RISCV_ISA_zcb    => false,              -- implement compressed extension?
+    RISCV_ISA_zcmt   => false,              -- implement compressed extension?
+    RISCV_ISA_M      => false,              -- implement mul/div extension?
+    RISCV_ISA_Zicntr => false,              -- implement base counters?
     -- Internal Instruction memory --
     IMEM_EN          => true,              -- implement processor-internal instruction memory
     IMEM_SIZE        => IMEM_SIZE, -- size of processor-internal instruction memory in bytes

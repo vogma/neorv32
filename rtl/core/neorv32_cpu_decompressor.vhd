@@ -23,13 +23,15 @@ entity neorv32_cpu_decompressor is
   generic (
     ZCB_EN   : boolean; -- enable Zcb ISA extension
     ZCMOP_EN : boolean; -- enable Zcmop ISA extension (requires Zimop ISA extension)
-    ZCMP_EN  : boolean  -- enable Zcmp ISA extension
+    ZCMP_EN  : boolean; -- enable Zcmp ISA extension
+    ZCMT_EN  : boolean  -- enable Zcmt ISA extension
   );
   port (
     instr_i : in  std_ulogic_vector(15 downto 0); -- compressed instruction
     instr_o : out std_ulogic_vector(31 downto 0);  -- decompressed instruction
     instr_is_zcmp : out std_ulogic; -- instruction is part of Zcmp extension
-    zcmp_op : out zcmp_op_t -- Zcmp operation type
+    zcmp_op : out zcmp_op_t; -- Zcmp operation type
+    instr_is_zcmt : out std_ulogic -- instruction is part of Zcmt extension (cm.jt/cm.jalt)
   );
 end entity;
 
@@ -68,6 +70,7 @@ begin
     decoded <= x"00000003"; -- empty rv32 instruction
     instr_is_zcmp <= '0';
     zcmp_op <= ZCMP_OP_NONE;
+    instr_is_zcmt <= '0';
 
     -- decoder --
     case instr_i(ci_opcode_msb_c downto ci_opcode_lsb_c) is
@@ -352,7 +355,9 @@ begin
 
           when "101" =>
 
-          if ZCMP_EN then
+          if ZCMT_EN and (instr_i(12 downto 10) = "000") then -- cm.jt / cm.jalt
+            instr_is_zcmt <= '1'; -- handled by the Zcmt table-jump sequencer
+          elsif ZCMP_EN then
             case instr_i(12 downto 8) is
               when "11000" => -- cm.push
                if (instr_i(7 downto 6) /= "00") then -- rlist >= 4; rlist < 4 is reserved

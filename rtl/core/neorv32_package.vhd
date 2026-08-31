@@ -422,6 +422,8 @@ package neorv32_package is
   constant csr_fflags_c         : std_ulogic_vector(11 downto 0) := x"001";
   constant csr_frm_c            : std_ulogic_vector(11 downto 0) := x"002";
   constant csr_fcsr_c           : std_ulogic_vector(11 downto 0) := x"003";
+  -- user trap setup --
+  constant csr_jvt_c            : std_ulogic_vector(11 downto 0) := x"017";
   -- machine trap setup --
   constant csr_mstatus_c        : std_ulogic_vector(11 downto 0) := x"300";
   constant csr_misa_c           : std_ulogic_vector(11 downto 0) := x"301";
@@ -770,9 +772,13 @@ package neorv32_package is
     i16             : std_ulogic_vector(15 downto 0); -- (original) 16-bit instruction word
     compr           : std_ulogic;                     -- instruction is decompressed
     fault           : std_ulogic;                     -- instruction-fetch error
-    zcmp_in_uop_seq  : std_ulogic;                     -- zcmp micro-op sequence running
-    zcmp_start       : std_ulogic;                     -- zcmp micro-op sequence is starting next cycle
-    zcmp_atomic_tail : std_ulogic;                     -- zcmp micro-op sequence is in atomic tail section (no traps allowed)
+    -- shared micro-op sequencer hold interface (used by both the Zcmp and the Zcmt sequencer) --
+    zcmp_in_uop_seq  : std_ulogic;                     -- micro-op sequence running
+    zcmp_start       : std_ulogic;                     -- micro-op sequence is starting next cycle
+    zcmp_atomic_tail : std_ulogic;                     -- micro-op sequence is in atomic tail section (no traps allowed)
+    -- Zcmt table-jump branch redirect --
+    zcmt_branch      : std_ulogic;                     -- current micro-op is a Zcmt jalr; override its branch target
+    zcmt_target      : std_ulogic_vector(31 downto 0); -- fetched jump-table entry (registered in the Zcmt sequencer; bypasses the uop-bus mux, stable through S_BRANCH)
   end record;
 
   -- ALU Function Codes ---------------------------------------------------------------------
@@ -935,6 +941,7 @@ package neorv32_package is
     RISCV_ISA_Zcb       : boolean                        := false;
     RISCV_ISA_Zcmop     : boolean                        := false;
     RISCV_ISA_Zcmp      : boolean                        := false;
+    RISCV_ISA_Zcmt      : boolean                        := false;
     RISCV_ISA_Zfinx     : boolean                        := false;
     RISCV_ISA_Zibi      : boolean                        := false;
     RISCV_ISA_Zicntr    : boolean                        := false;

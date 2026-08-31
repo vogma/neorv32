@@ -30,6 +30,8 @@ This chapter gives a brief overview of all available ISA extensions.
 | <<_c_isa_extension,`Zca`>> (an alias)    | Compressed instruction without floating-point operations     | Implicitly enabled via <<_processor_top_entity_generics, `RISCV_ISA_C`>>
 | <<_zcb_isa_extension,`Zcb`>>             | Additional code size reduction instructions (build upon `C`) | <<_processor_top_entity_generics, `RISCV_ISA_Zcb`>>
 | <<_zcmop_isa_extension,`Zcmop`>>         | Compressed may-be-operation (build upon `C` + `Zimop`)       | <<_processor_top_entity_generics, `RISCV_ISA_Zcmop`>>
+| <<_zcmp_isa_extension,`Zcmp`>>           | Compressed push/pop instructions (build upon `C`)            | <<_processor_top_entity_generics, `RISCV_ISA_Zcmp`>>
+| <<_zcmt_isa_extension,`Zcmt`>>           | Compressed table jump instructions (build upon `C`)          | <<_processor_top_entity_generics, `RISCV_ISA_Zcmt`>>
 | <<_zfinx_isa_extension,`Zfinx`>>         | Floating-point instructions using integer registers          | <<_processor_top_entity_generics, `RISCV_ISA_Zfinx`>>
 | <<_zibi_isa_extension,`Zibi`>>           | Branches with immediate-comparison                           | <<_processor_top_entity_generics, `RISCV_ISA_Zibi`>>
 | <<_zicntr_isa_extension,`Zicntr`>>       | Base counters extension                                      | <<_processor_top_entity_generics, `RISCV_ISA_Zicntr`>>
@@ -466,6 +468,53 @@ Note that this extensions requires the <<_zimop_isa_extension>> & <<_c_isa_exten
 |=======================
 | Class | Instructions | Execution cycles
 | System | `c.mop.n` | 3
+|=======================
+
+
+==== `Zcmp` ISA Extension
+
+The `Zcmp` ISA extension adds compressed push/pop and double-move instructions for embedded code-size
+reduction. It is enabled by the top's <<_processor_top_entity_generics, `RISCV_ISA_Zcmp`>> generic and
+requires the <<_c_isa_extension>>. The instructions are implemented by a micro-op sequencer
+(`rtl/core/neorv32_cpu_zcmp.vhd`) that expands each instruction into a sequence of rv32i base
+instructions (loads/stores, stack-pointer adjustment, register moves, return jump). A sequence that is
+interrupted before its non-restartable tail restarts transparently with `mepc` = address of the Zcmp
+instruction itself.
+
+.Instructions and Timing
+[cols="<2,<5,<4"]
+[options="header", grid="rows"]
+|=======================
+| Class | Instructions | Execution cycles
+| System | `cm.push` `cm.pop` `cm.popret` `cm.popretz` `cm.mva01s` `cm.mvsa01` | 3 per micro-op
+|=======================
+
+
+==== `Zcmt` ISA Extension
+
+The `Zcmt` ISA extension adds table jump instructions for embedded code-size reduction: `cm.jt index`
+(index 0..31, plain jump) and `cm.jalt index` (index 32..255, writes `ra` = PC + 2). It is enabled by
+the top's <<_processor_top_entity_generics, `RISCV_ISA_Zcmt`>> generic and requires the
+<<_c_isa_extension>> (it is independent of `Zcmp`). The extension adds the <<_jvt>> CSR that holds the
+256-entry jump table's base address (64-byte aligned).
+
+Execution reads the 32-bit table entry at `jvt.base + index * 4` and jumps to that address with bit 0
+cleared. The table read is performed via the instruction fetch bus and is architecturally an *implicit
+instruction fetch*: it requires PMP *execute* permission (read permission is irrelevant) and a failing
+table read raises an instruction access fault with `mepc` = address of the `cm.jt`/`cm.jalt` itself and
+<<_mtval>> = 0 (a faulting `cm.jalt` does not write `ra`). If instead the *target* fetch fails, the jump
+itself completes (including the `ra` link) and the fault reports `mepc` = jump target. The instruction
+is fully restartable: an interrupt is either taken before it (with `mepc` = its address) or - if it
+arrives while the table is being read - after it completes (with `mepc` = jump target); it is
+implemented by a dedicated sequencer (`rtl/core/neorv32_cpu_zcmt.vhd`) that injects a single `jalr`
+micro-op whose branch target is overridden with the fetched table entry.
+
+.Instructions and Timing
+[cols="<2,<5,<4"]
+[options="header", grid="rows"]
+|=======================
+| Class | Instructions | Execution cycles
+| System | `cm.jt` `cm.jalt` | 6 + table-read memory latency
 |=======================
 
 
